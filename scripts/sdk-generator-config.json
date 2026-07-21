@@ -1,0 +1,8 @@
+{
+  "name": "ArchAstroPlatform",
+  "version": "0.1.0",
+  "baseUrl": "https://platform.archastro.ai",
+  "apiBase": "/api",
+  "defaultVersion": "v1",
+  "description": "Swift SDK for the ArchAstro Platform API"
+}
