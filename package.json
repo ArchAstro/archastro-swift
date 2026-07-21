@@ -1,0 +1,13 @@
+{
+  "name": "archastro-swift-tooling",
+  "private": true,
+  "description": "JS tooling for the ArchAstro Swift SDK: generator, Prism mock, channel harness.",
+  "scripts": {
+    "regenerate": "bash scripts/regenerate_sdk.sh"
+  },
+  "devDependencies": {
+    "@archastro/channel-harness": "latest",
+    "@archastro/sdk-generator": "latest",
+    "@stoplight/prism-cli": "5.14.2"
+  }
+}
