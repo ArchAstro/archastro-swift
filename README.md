@@ -8,6 +8,26 @@ with a hand-maintained async runtime. The Swift sibling of
 
 Requires Swift 6 / Xcode 16+. Platforms: macOS 13+, iOS 16+, tvOS 16+, watchOS 9+.
 
+## Installation
+
+Swift Package Manager — add the package to your `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/ArchAstro/archastro-swift.git", from: "0.1.0")
+]
+```
+
+and depend on the `ArchAstroPlatform` product:
+
+```swift
+.target(name: "MyApp", dependencies: [
+    .product(name: "ArchAstroPlatform", package: "archastro-swift")
+])
+```
+
+In Xcode: File → Add Package Dependencies… → paste the repository URL.
+
 ## Usage
 
 ```swift
@@ -84,3 +104,21 @@ Contract tests spawn Prism (`node_modules/.bin/prism`) against
 `@archastro/channel-harness` service, exactly like the TypeScript and
 Python SDK suites. Overrides: `PRISM_PORT`, `PRISM_BIN`,
 `OPENAPI_SPEC_PATH`, `ARCHASTRO_HARNESS_BIN`.
+
+## Releasing
+
+Consumers resolve versions from semver git tags — cut a release with:
+
+```bash
+git tag 0.1.0 && git push origin 0.1.0
+```
+
+For listing on the [Swift Package Index](https://swiftpackageindex.com),
+submit the repository URL once via a PR to
+[SwiftPackageIndex/PackageList](https://github.com/SwiftPackageIndex/PackageList);
+`.spi.yml` configures its documentation build.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Every source file carries the copyright
+header (`scripts/check_headers.sh` enforces it).

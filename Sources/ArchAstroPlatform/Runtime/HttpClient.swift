@@ -1,3 +1,6 @@
+// Copyright (c) 2026 ArchAstro Inc. Licensed under the MIT License.
+// See LICENSE for details.
+
 // Runtime: async HTTP client for the generated Platform SDK.
 // This file is hand-maintained, not generated. Port of the Python SDK's
 // archastro/platform/runtime/http_client.py.

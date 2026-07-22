@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 ArchAstro Inc. Licensed under the MIT License.
 # Regenerate the Swift SDK + contract tests from the canonical OpenAPI spec.
 #
 # Usage:

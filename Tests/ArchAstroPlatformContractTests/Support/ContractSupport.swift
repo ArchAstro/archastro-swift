@@ -1,3 +1,6 @@
+// Copyright (c) 2026 ArchAstro Inc. Licensed under the MIT License.
+// See LICENSE for details.
+
 // Test support: Prism + channel-harness lifecycle for contract tests.
 // This file is hand-maintained, not generated — the Swift analogue of the
 // generated Python conftest.py plus the handwritten HarnessServiceClient.

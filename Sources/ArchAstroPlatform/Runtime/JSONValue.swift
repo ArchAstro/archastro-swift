@@ -1,3 +1,6 @@
+// Copyright (c) 2026 ArchAstro Inc. Licensed under the MIT License.
+// See LICENSE for details.
+
 // Runtime: JSON value type for the generated Platform SDK.
 // This file is hand-maintained, not generated.
 
