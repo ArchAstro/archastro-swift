@@ -1,3 +1,6 @@
+// Copyright (c) 2026 ArchAstro Inc. Licensed under the MIT License.
+// See LICENSE for details.
+
 // Runtime: Phoenix Channels client for the generated Platform SDK.
 // This file is hand-maintained, not generated. Port of the Python SDK's
 // archastro/phx_channel package.

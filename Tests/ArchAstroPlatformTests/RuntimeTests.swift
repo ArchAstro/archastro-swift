@@ -1,3 +1,6 @@
+// Copyright (c) 2026 ArchAstro Inc. Licensed under the MIT License.
+// See LICENSE for details.
+
 // Unit tests for the hand-maintained runtime (JSONValue, JSON coding,
 // error parsing, SSE framing). The contract tests cover the generated
 // surface; these cover runtime behavior that doesn't need a server.

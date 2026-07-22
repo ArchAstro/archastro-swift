@@ -1,3 +1,6 @@
+// Copyright (c) 2026 ArchAstro Inc. Licensed under the MIT License.
+// See LICENSE for details.
+
 // Test support: client for the channel-harness service's control API.
 // This file is hand-maintained, not generated — the Swift counterpart to
 // archastro.phx_channel.HarnessServiceClient (Python) and the TS client in

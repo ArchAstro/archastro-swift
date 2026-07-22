@@ -9,5 +9,20 @@
     "@archastro/channel-harness": "latest",
     "@archastro/sdk-generator": "latest",
     "@stoplight/prism-cli": "5.14.2"
+  },
+  "overrides": {
+    "@stoplight/prism-core": "5.8.0",
+    "@stoplight/prism-http": "5.12.0",
+    "@stoplight/prism-http-server": "5.12.2",
+    "@tootallnate/once": "2.0.1",
+    "fast-uri": "3.1.4",
+    "fast-xml-parser": "5.8.0",
+    "js-yaml": "4.3.0",
+    "lodash": "4.18.1",
+    "uuid": "11.1.1",
+    "ws": "8.21.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

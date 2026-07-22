@@ -1,4 +1,6 @@
 // swift-tools-version: 6.0
+// Copyright (c) 2026 ArchAstro Inc. Licensed under the MIT License.
+// See LICENSE for details.
 import PackageDescription
 
 let package = Package(
