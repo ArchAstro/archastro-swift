@@ -1,0 +1,43 @@
+name: Release
+
+# Swift packages release via semver git tags. This workflow validates the
+# tagged commit builds and passes unit + REST contract tests, then
+# publishes a GitHub Release so the tag shows up with notes (and the
+# Swift Package Index picks up the new version).
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Validate + publish release
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Copyright headers
+        run: ./scripts/check_headers.sh
+
+      - name: Setup Node (for prism)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      - name: Build
+        run: swift build
+
+      - name: Tests (unit + REST contract)
+        run: swift test
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes
