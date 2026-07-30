@@ -103,6 +103,48 @@ import Testing
     }
 }
 
+@Suite struct GeneratedResponseCompatibilityTests {
+    @Test func team_thread_creator_accepts_an_unexpanded_user_id() throws {
+        let response = try JSONCoding.decode(
+            TeamThreadListResponse.self,
+            from: Data(
+                """
+                {
+                  "data": [{
+                    "id": "thr_room",
+                    "creator": "usr_creator"
+                  }]
+                }
+                """.utf8
+            )
+        )
+
+        #expect(response.data.first?.creator?.id == "usr_creator")
+    }
+
+    @Test func team_thread_creator_still_accepts_an_expanded_user() throws {
+        let response = try JSONCoding.decode(
+            TeamThreadListResponse.self,
+            from: Data(
+                """
+                {
+                  "data": [{
+                    "id": "thr_room",
+                    "creator": {
+                      "id": "usr_creator",
+                      "name": "Creator"
+                    }
+                  }]
+                }
+                """.utf8
+            )
+        )
+
+        #expect(response.data.first?.creator?.id == "usr_creator")
+        #expect(response.data.first?.creator?.name == "Creator")
+    }
+}
+
 @Suite struct ApiErrorParsingTests {
     private func parse(_ json: String, status: Int) -> ApiError {
         HttpClient.parseApiError(Data(json.utf8), status: status)

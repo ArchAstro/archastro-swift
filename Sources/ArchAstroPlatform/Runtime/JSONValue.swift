@@ -115,7 +115,7 @@ public enum JSONValue: Codable, Hashable, Sendable {
     /// Re-decode this JSON value into a typed `Decodable`.
     public func decode<T: Decodable>(_ type: T.Type = T.self) throws -> T {
         let data = try JSONCoding.encoder.encode(self)
-        return try JSONCoding.decoder.decode(T.self, from: data)
+        return try JSONCoding.decode(T.self, from: data)
     }
 
     /// Build a `JSONValue` from any `Encodable` (via a JSON round-trip).
@@ -215,6 +215,46 @@ public enum JSONCoding {
             return date
         }
         return decoder
+    }
+
+    /// Decode a generated SDK response while normalizing legacy platform wire
+    /// shapes that predate the current expanded-object schema.
+    public static func decode<T: Decodable>(
+        _ type: T.Type,
+        from data: Data
+    ) throws -> T {
+        do {
+            return try decoder.decode(T.self, from: data)
+        } catch {
+            guard
+                T.self == TeamThreadListResponse.self,
+                let normalized = normalizeTeamThreadCreators(in: data)
+            else {
+                throw error
+            }
+            return try decoder.decode(T.self, from: normalized)
+        }
+    }
+
+    private static func normalizeTeamThreadCreators(in data: Data) -> Data? {
+        guard
+            var root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+            var items = root["data"] as? [[String: Any]]
+        else {
+            return nil
+        }
+
+        var changed = false
+        for index in items.indices {
+            if let creatorID = items[index]["creator"] as? String {
+                items[index]["creator"] = ["id": creatorID]
+                changed = true
+            }
+        }
+        guard changed else { return nil }
+        root["data"] = items
+        return try? JSONSerialization.data(withJSONObject: root)
     }
 
     public static var encoder: JSONEncoder {

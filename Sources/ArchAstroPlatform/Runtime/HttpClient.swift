@@ -144,7 +144,7 @@ public final class HttpClient: @unchecked Sendable {
                 message: "Server returned no body for an operation that promises one"
             )
         }
-        return try JSONCoding.decoder.decode(T.self, from: data)
+        return try JSONCoding.decode(T.self, from: data)
     }
 
     /// Issue a request, discarding any response body.
