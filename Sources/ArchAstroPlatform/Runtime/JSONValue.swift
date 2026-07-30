@@ -163,8 +163,9 @@ extension JSONValue: ExpressibleByDictionaryLiteral {
 
 // MARK: - JSON coding configuration
 
-/// Shared encoder/decoder with the SDK's datetime conventions (ISO-8601,
-/// fractional seconds tolerated on decode).
+/// Shared encoder/decoder with the SDK's datetime conventions. Decoding
+/// accepts ISO-8601 timestamps with optional fractional seconds and treats
+/// timestamps without an explicit timezone as UTC.
 public enum JSONCoding {
     nonisolated(unsafe) private static let isoFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -183,7 +184,19 @@ public enum JSONCoding {
     }
 
     public static func parseDate(_ string: String) -> Date? {
-        isoFractionalFormatter.date(from: string) ?? isoFormatter.date(from: string)
+        if let date = isoFractionalFormatter.date(from: string)
+            ?? isoFormatter.date(from: string)
+        {
+            return date
+        }
+
+        // Some platform resources historically emitted database timestamps
+        // without a timezone suffix. They represent UTC, so normalize them at
+        // the SDK boundary rather than forcing every client to decode around
+        // otherwise valid generated models.
+        let assumedUTC = string + "Z"
+        return isoFractionalFormatter.date(from: assumedUTC)
+            ?? isoFormatter.date(from: assumedUTC)
     }
 
     public static var decoder: JSONDecoder {
