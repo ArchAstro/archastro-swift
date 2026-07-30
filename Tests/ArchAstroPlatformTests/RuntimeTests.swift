@@ -62,9 +62,14 @@ import Testing
 }
 
 @Suite struct JSONCodingTests {
-    @Test func parses_iso_dates_with_and_without_fractional_seconds() {
-        #expect(JSONCoding.parseDate("2024-01-01T00:00:00Z") != nil)
-        #expect(JSONCoding.parseDate("2024-01-01T00:00:00.123Z") != nil)
+    @Test func parses_iso_dates_with_optional_fractional_seconds_and_timezones() {
+        let expected = Date(timeIntervalSince1970: 1_704_067_200)
+
+        #expect(JSONCoding.parseDate("2024-01-01T00:00:00Z") == expected)
+        #expect(JSONCoding.parseDate("2024-01-01T00:00:00.000Z") == expected)
+        #expect(JSONCoding.parseDate("2024-01-01T01:00:00+01:00") == expected)
+        #expect(JSONCoding.parseDate("2024-01-01T00:00:00") == expected)
+        #expect(JSONCoding.parseDate("2024-01-01T00:00:00.000000") == expected)
         #expect(JSONCoding.parseDate("not-a-date") == nil)
     }
 
@@ -75,6 +80,17 @@ import Testing
         let json = #"{"at":"2024-06-01T12:30:00.500Z"}"#
         let decoded = try JSONCoding.decoder.decode(Stamped.self, from: Data(json.utf8))
         #expect(decoded.at.timeIntervalSince1970 > 0)
+    }
+
+    @Test func decodes_production_timestamp_without_timezone_inside_models() throws {
+        struct Stamped: Codable {
+            var at: Date
+        }
+        let json = #"{"at":"2026-07-23T01:16:47"}"#
+        let decoded = try JSONCoding.decoder.decode(Stamped.self, from: Data(json.utf8))
+        #expect(
+            JSONCoding.isoString(from: decoded.at) == "2026-07-23T01:16:47Z"
+        )
     }
 
     @Test func encodes_dates_as_iso_strings() throws {
