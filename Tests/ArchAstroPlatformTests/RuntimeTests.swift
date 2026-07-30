@@ -143,6 +143,51 @@ import Testing
         #expect(response.data.first?.creator?.id == "usr_creator")
         #expect(response.data.first?.creator?.name == "Creator")
     }
+
+    @Test func thread_message_accepts_an_expanded_user() throws {
+        let response = try JSONCoding.decode(
+            ThreadMessagesResponse.self,
+            from: Data(
+                """
+                {
+                  "data": {
+                    "messages": [{
+                      "id": "msg_room",
+                      "user": {
+                        "id": "usr_author",
+                        "name": "Author"
+                      }
+                    }]
+                  }
+                }
+                """.utf8
+            )
+        )
+
+        #expect(response.data.messages.first?.user == "usr_author")
+    }
+
+    @Test func channel_message_accepts_an_expanded_user() throws {
+        let payload = try JSONCoding.decode(
+            ApiChatMessageAddedPayload.self,
+            from: Data(
+                """
+                {
+                  "thread_id": "thr_room",
+                  "message": {
+                    "id": "msg_room",
+                    "user": {
+                      "id": "usr_author",
+                      "name": "Author"
+                    }
+                  }
+                }
+                """.utf8
+            )
+        )
+
+        #expect(payload.message?.user == "usr_author")
+    }
 }
 
 @Suite struct ApiErrorParsingTests {

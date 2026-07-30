@@ -226,10 +226,19 @@ public enum JSONCoding {
         do {
             return try decoder.decode(T.self, from: data)
         } catch {
-            guard
-                T.self == TeamThreadListResponse.self,
-                let normalized = normalizeTeamThreadCreators(in: data)
-            else {
+            let normalized: Data?
+            if T.self == TeamThreadListResponse.self {
+                normalized = normalizeTeamThreadCreators(in: data)
+            } else if T.self == ThreadMessagesResponse.self {
+                normalized = normalizeThreadMessageUsers(in: data)
+            } else if T.self == ApiChatMessageAddedPayload.self
+                || T.self == ApiChatMessageUpdatedPayload.self
+            {
+                normalized = normalizeChannelMessageUser(in: data)
+            } else {
+                normalized = nil
+            }
+            guard let normalized else {
                 throw error
             }
             return try decoder.decode(T.self, from: normalized)
@@ -255,6 +264,66 @@ public enum JSONCoding {
         guard changed else { return nil }
         root["data"] = items
         return try? JSONSerialization.data(withJSONObject: root)
+    }
+
+    private static func normalizeThreadMessageUsers(in data: Data) -> Data? {
+        guard
+            var root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+            var envelope = root["data"] as? [String: Any],
+            var messages = envelope["messages"] as? [[String: Any]]
+        else {
+            return nil
+        }
+
+        let changed = messages.indices.reduce(into: false) { changed, index in
+            changed = normalizeMessageUser(in: &messages[index]) || changed
+        }
+        guard changed else { return nil }
+        envelope["messages"] = messages
+        root["data"] = envelope
+        return try? JSONSerialization.data(withJSONObject: root)
+    }
+
+    private static func normalizeChannelMessageUser(in data: Data) -> Data? {
+        guard
+            var root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+            var message = root["message"] as? [String: Any],
+            normalizeMessageUser(in: &message)
+        else {
+            return nil
+        }
+
+        root["message"] = message
+        return try? JSONSerialization.data(withJSONObject: root)
+    }
+
+    private static func normalizeMessageUser(
+        in message: inout [String: Any]
+    ) -> Bool {
+        var changed = false
+        if
+            let expandedUser = message["user"] as? [String: Any],
+            let userID = expandedUser["id"] as? String
+        {
+            message["user"] = userID
+            changed = true
+        }
+
+        if var reactions = message["reactions"] as? [[String: Any]] {
+            for index in reactions.indices {
+                if
+                    let expandedUser = reactions[index]["user"] as? [String: Any],
+                    let userID = expandedUser["id"] as? String
+                {
+                    reactions[index]["user"] = userID
+                    changed = true
+                }
+            }
+            message["reactions"] = reactions
+        }
+        return changed
     }
 
     public static var encoder: JSONEncoder {
