@@ -104,6 +104,11 @@ import Testing
 }
 
 @Suite struct GeneratedResponseCompatibilityTests {
+    /// Regen types expandable Thread.creator as JSONValue (id string or user object).
+    private func creatorJSON(_ response: TeamThreadListResponse) -> JSONValue? {
+        response.data.first.flatMap { $0.creator.flatMap { $0 } }
+    }
+
     @Test func team_thread_creator_accepts_an_unexpanded_user_id() throws {
         let response = try JSONCoding.decode(
             TeamThreadListResponse.self,
@@ -112,6 +117,7 @@ import Testing
                 {
                   "data": [{
                     "id": "thr_room",
+                    "visibility": "default",
                     "creator": "usr_creator"
                   }]
                 }
@@ -119,7 +125,7 @@ import Testing
             )
         )
 
-        #expect(response.data.first?.creator?.id == "usr_creator")
+        #expect(creatorJSON(response)?["id"] == "usr_creator")
     }
 
     @Test func team_thread_creator_still_accepts_an_expanded_user() throws {
@@ -130,6 +136,7 @@ import Testing
                 {
                   "data": [{
                     "id": "thr_room",
+                    "visibility": "default",
                     "creator": {
                       "id": "usr_creator",
                       "name": "Creator"
@@ -140,8 +147,8 @@ import Testing
             )
         )
 
-        #expect(response.data.first?.creator?.id == "usr_creator")
-        #expect(response.data.first?.creator?.name == "Creator")
+        #expect(creatorJSON(response)?["id"] == "usr_creator")
+        #expect(creatorJSON(response)?["name"] == "Creator")
     }
 
     @Test func thread_message_accepts_an_expanded_user() throws {

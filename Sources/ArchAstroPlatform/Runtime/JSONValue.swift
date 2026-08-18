@@ -223,26 +223,22 @@ public enum JSONCoding {
         _ type: T.Type,
         from data: Data
     ) throws -> T {
-        do {
-            return try decoder.decode(T.self, from: data)
-        } catch {
-            let normalized: Data?
-            if T.self == TeamThreadListResponse.self {
-                normalized = normalizeTeamThreadCreators(in: data)
-            } else if T.self == ThreadMessagesResponse.self {
-                normalized = normalizeThreadMessageUsers(in: data)
-            } else if T.self == ApiChatMessageAddedPayload.self
-                || T.self == ApiChatMessageUpdatedPayload.self
-            {
-                normalized = normalizeChannelMessageUser(in: data)
-            } else {
-                normalized = nil
-            }
-            guard let normalized else {
-                throw error
-            }
-            return try decoder.decode(T.self, from: normalized)
+        // Apply first, not only on decode failure. Expandable fields are now
+        // JSONValue, so both the ID string and the object decode — the
+        // catch path never ran and callers lost the stable ID shape.
+        let prepared: Data
+        if T.self == TeamThreadListResponse.self {
+            prepared = normalizeTeamThreadCreators(in: data) ?? data
+        } else if T.self == ThreadMessagesResponse.self {
+            prepared = normalizeThreadMessageUsers(in: data) ?? data
+        } else if T.self == ApiChatMessageAddedPayload.self
+            || T.self == ApiChatMessageUpdatedPayload.self
+        {
+            prepared = normalizeChannelMessageUser(in: data) ?? data
+        } else {
+            prepared = data
         }
+        return try decoder.decode(T.self, from: prepared)
     }
 
     private static func normalizeTeamThreadCreators(in data: Data) -> Data? {
