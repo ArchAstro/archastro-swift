@@ -60,8 +60,15 @@ jobs:
             >/tmp/prism.out 2>/tmp/prism.err &
           prism_pid=$!
           trap 'kill "$prism_pid" 2>/dev/null || true' EXIT
+          prism_up() {
+            # Any HTTP response means the mock is listening. GET / is not
+            # in the spec, so Prism 404s; curl -f treated that as down.
+            local code
+            code=$(curl -sS -m 1 -o /dev/null -w '%{http_code}' http://127.0.0.1:4040/ || true)
+            [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]
+          }
           for i in $(seq 1 60); do
-            if curl -sf -m 1 http://127.0.0.1:4040/ >/dev/null; then
+            if prism_up; then
               echo "prism answering after ${i} probe(s)"
               break
             fi
@@ -72,7 +79,7 @@ jobs:
             fi
             sleep 0.5
           done
-          curl -sf -m 1 http://127.0.0.1:4040/ >/dev/null
+          prism_up
           echo "=== one REST ping ==="
           swift test --skip-build --filter status_ping_success
           echo "=== full REST suite ==="
