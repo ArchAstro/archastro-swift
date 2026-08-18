@@ -228,11 +228,13 @@ actor TestServers {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: bin)
+        // Static examples keep shape-contract tests deterministic. Prism's
+        // dynamic faker can hang or crash on valid nested oneOf schemas
+        // (ActivityFeed); JS and Python already run static for that reason.
         process.arguments = [
             "mock", ContractSupport.specPath,
             "--port", ContractSupport.prismPort,
             "--host", "127.0.0.1",
-            "--dynamic",
         ]
         // Hold stdin open — the test runner's own stdin may be closed, and
         // an inherited closed stdin can make child processes exit early.
