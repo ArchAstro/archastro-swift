@@ -197,7 +197,10 @@ actor TestServers {
 
     private var prismProcess: Process?
     private var prismStdin: Pipe?
+    private var prismStderr: FileHandle?
     private var prismReady = false
+    private var prismStarting = false
+    private var prismStartError: (any Error)?
     private var harnessProcess: Process?
     private var harnessStdin: Pipe?
     private var harnessStderr: FileHandle?
@@ -219,14 +222,35 @@ actor TestServers {
 
     func ensurePrism() async throws {
         if prismReady { return }
-
-        // A Prism already listening (a prior run, or started externally)
-        // serves the same spec — use it.
-        if await prismAnswers() {
-            prismReady = true
+        if let prismStartError { throw prismStartError }
+        if prismStarting {
+            while prismStarting {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if prismReady { return }
+            if let prismStartError { throw prismStartError }
             return
         }
 
+        // Set before any await so parallel suites cannot spawn a second
+        // Prism on the same port (that race wedged GitHub-hosted macOS).
+        prismStarting = true
+        defer { prismStarting = false }
+
+        do {
+            if await prismAnswers() {
+                prismReady = true
+                return
+            }
+            try await startPrismProcess()
+            prismReady = true
+        } catch {
+            prismStartError = error
+            throw error
+        }
+    }
+
+    private func startPrismProcess() async throws {
         let bin = ContractSupport.prismBin
         guard FileManager.default.fileExists(atPath: bin) else {
             throw ContractTestError.prismStartFailed(
@@ -247,30 +271,34 @@ actor TestServers {
         // Hold stdin open — the test runner's own stdin may be closed, and
         // an inherited closed stdin can make child processes exit early.
         let stdin = Pipe()
+        let stderrURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("archastro-prism-\(ProcessInfo.processInfo.processIdentifier).err")
+        FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+        let stderrHandle = try FileHandle(forWritingTo: stderrURL)
         process.standardInput = stdin
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        process.standardError = stderrHandle
         try process.run()
         prismProcess = process
         prismStdin = stdin
+        prismStderr = stderrHandle
         ProcessReaper.shared.track(process)
 
-        // Poll until Prism answers.
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
             if await prismAnswers() {
-                prismReady = true
                 return
             }
             if !process.isRunning {
                 throw ContractTestError.prismStartFailed(
-                    "Prism exited with code \(process.terminationStatus)"
+                    "Prism exited with code \(process.terminationStatus)\n\(readFile(stderrURL))"
                 )
             }
             try await Task.sleep(nanoseconds: 300_000_000)
         }
+        process.terminate()
         throw ContractTestError.prismStartFailed(
-            "Prism did not start on port \(ContractSupport.prismPort) within 30s"
+            "Prism did not start on port \(ContractSupport.prismPort) within 30s\n\(readFile(stderrURL))"
         )
     }
 

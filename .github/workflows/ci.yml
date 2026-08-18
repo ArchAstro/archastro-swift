@@ -53,7 +53,30 @@ jobs:
 
       - name: REST contract tests
         timeout-minutes: 5
-        run: swift test --skip-build --filter 'ArchAstroPlatformContractTests[.]'
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/prism mock specs/platform-openapi.json \
+            --port 4040 --host 127.0.0.1 \
+            >/tmp/prism.out 2>/tmp/prism.err &
+          prism_pid=$!
+          trap 'kill "$prism_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -sf -m 1 http://127.0.0.1:4040/ >/dev/null; then
+              echo "prism answering after ${i} probe(s)"
+              break
+            fi
+            if ! kill -0 "$prism_pid" 2>/dev/null; then
+              echo "prism exited before answering" >&2
+              cat /tmp/prism.err >&2 || true
+              exit 1
+            fi
+            sleep 0.5
+          done
+          curl -sf -m 1 http://127.0.0.1:4040/ >/dev/null
+          echo "=== one REST ping ==="
+          swift test --skip-build --filter status_ping_success
+          echo "=== full REST suite ==="
+          swift test --skip-build --filter 'ArchAstroPlatformContractTests[.]'
 
       - name: Channel and stream contract tests
         timeout-minutes: 5
