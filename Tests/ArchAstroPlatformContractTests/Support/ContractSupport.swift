@@ -200,15 +200,21 @@ actor TestServers {
     private var prismReady = false
     private var harnessProcess: Process?
     private var harnessStdin: Pipe?
-    private var harnessStderr: Pipe?
+    private var harnessStderr: FileHandle?
     private var harnessUrls: HarnessUrls?
     private var harnessStartError: (any Error)?
 
     // MARK: Prism
 
+    private func httpAnswers(_ urlString: String) async -> Bool {
+        guard let url = URL(string: urlString) else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1
+        return (try? await URLSession.shared.data(for: request)) != nil
+    }
+
     private func prismAnswers() async -> Bool {
-        guard let probeURL = URL(string: "\(ContractSupport.prismURL)/") else { return false }
-        return (try? await URLSession.shared.data(from: probeURL)) != nil
+        await httpAnswers("\(ContractSupport.prismURL)/")
     }
 
     func ensurePrism() async throws {
@@ -284,6 +290,15 @@ actor TestServers {
     }
 
     private func startHarness() async throws -> HarnessUrls {
+        // CI (or a developer) can pre-start the service and hand us URLs.
+        // Skip spawn so we never block the test process on child I/O.
+        if let ws = ProcessInfo.processInfo.environment["ARCHASTRO_HARNESS_WS_URL"],
+           let control = ProcessInfo.processInfo.environment["ARCHASTRO_HARNESS_CONTROL_URL"],
+           !ws.isEmpty, !control.isEmpty
+        {
+            return HarnessUrls(wsUrl: ws, controlUrl: control)
+        }
+
         let bin = ContractSupport.harnessBin
         guard FileManager.default.fileExists(atPath: bin) else {
             throw ContractTestError.harnessStartFailed(
@@ -291,58 +306,62 @@ actor TestServers {
             )
         }
 
+        // Bind fixed ports and poll GET /health. FileHandle.availableData and
+        // readabilityHandler both block the TestServers actor under
+        // `swift test` on GitHub-hosted macOS, so the previous 15s stdout
+        // deadline never fired and every contract test stalled with it.
+        let wsPort = ProcessInfo.processInfo.environment["ARCHASTRO_HARNESS_WS_PORT"] ?? "18765"
+        let controlPort = ProcessInfo.processInfo.environment["ARCHASTRO_HARNESS_CONTROL_PORT"] ?? "18766"
+        let urls = HarnessUrls(
+            wsUrl: "ws://127.0.0.1:\(wsPort)/socket/websocket",
+            controlUrl: "http://127.0.0.1:\(controlPort)"
+        )
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["node", bin, ContractSupport.specPath]
+        process.arguments = [
+            "node", bin, ContractSupport.specPath,
+            "--ws-port", wsPort,
+            "--control-port", controlPort,
+        ]
         process.currentDirectoryURL = ContractSupport.packageRoot
         process.environment = ProcessInfo.processInfo.environment
-        let stdout = Pipe()
-        let stderr = Pipe()
-        // The harness exits when its stdin closes — hold a pipe open.
+        // Hold stdin open — the harness exits on stdin_close, and
+        // `swift test` in GitHub Actions starts with stdin already closed.
         let stdin = Pipe()
+        let stderrURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("archastro-harness-\(ProcessInfo.processInfo.processIdentifier).err")
+        FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+        let stderrHandle = try FileHandle(forWritingTo: stderrURL)
         process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = stderrHandle
         try process.run()
         harnessProcess = process
         harnessStdin = stdin
-        harnessStderr = stderr
+        harnessStderr = stderrHandle
         ProcessReaper.shared.track(process)
 
-        // Poll the pipe. FileHandle.readabilityHandler is unreliable under
-        // `swift test` on GitHub-hosted macOS and can wait forever; each
-        // retry used to cost another 15s and starve the runner.
-        let deadline = Date().addingTimeInterval(15)
-        var buffer = Data()
+        let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
             if !process.isRunning {
-                let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                 throw ContractTestError.harnessStartFailed(
-                    "harness service exited with code \(process.terminationStatus) before reporting URLs\n\(err)"
+                    "harness service exited with code \(process.terminationStatus) before /health answered\n\(readFile(stderrURL))"
                 )
             }
-            let chunk = stdout.fileHandleForReading.availableData
-            if !chunk.isEmpty {
-                buffer.append(chunk)
-                if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                    let line = String(decoding: buffer[..<newline], as: UTF8.self)
-                        .trimmingCharacters(in: .whitespaces)
-                    guard
-                        let parsed = try? JSONCoding.decoder.decode(JSONValue.self, from: Data(line.utf8)),
-                        let ws = parsed["wsUrl"]?.stringValue,
-                        let control = parsed["controlUrl"]?.stringValue
-                    else {
-                        throw ContractTestError.harnessStartFailed("Unparseable harness URL line: \(line)")
-                    }
-                    return HarnessUrls(wsUrl: ws, controlUrl: control)
-                }
+            if await httpAnswers("\(urls.controlUrl)/health") {
+                return urls
             }
-            try await Task.sleep(nanoseconds: 50_000_000)
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
-        let err = String(data: stderr.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+        process.terminate()
         throw ContractTestError.harnessStartFailed(
-            "harness service did not report URLs within 15s\n\(err)"
+            "harness service did not answer \(urls.controlUrl)/health within 30s\n\(readFile(stderrURL))"
         )
+    }
+
+    private func readFile(_ url: URL) -> String {
+        (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 }
 
