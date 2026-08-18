@@ -46,9 +46,20 @@ jobs:
         timeout-minutes: 20
         run: swift build --build-tests
 
-      - name: Tests (unit + REST + channel/stream contract)
-        timeout-minutes: 10
-        run: swift test --skip-build --verbose
+      # Split so a hang names the suite. One combined `swift test` on
+      # GitHub-hosted macOS sits in Tests until the runner dies; local
+      # 1401-test runs finish in ~5s, so this is environment-specific.
+      - name: Unit tests
+        timeout-minutes: 3
+        run: swift test --skip-build --filter 'ArchAstroPlatformTests[.]'
+
+      - name: REST contract tests
+        timeout-minutes: 5
+        run: swift test --skip-build --filter 'ArchAstroPlatformContractTests[.]'
+
+      - name: Channel and stream contract tests
+        timeout-minutes: 5
+        run: swift test --skip-build --filter 'ChannelContractTests|StreamContractTests|HarnessLifecycle'
         env:
           ARCHASTRO_RUN_CHANNEL_CONTRACT_TESTS: "1"
 
