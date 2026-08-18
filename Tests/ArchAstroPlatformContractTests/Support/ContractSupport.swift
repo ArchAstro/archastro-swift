@@ -200,7 +200,9 @@ actor TestServers {
     private var prismReady = false
     private var harnessProcess: Process?
     private var harnessStdin: Pipe?
+    private var harnessStderr: Pipe?
     private var harnessUrls: HarnessUrls?
+    private var harnessStartError: (any Error)?
 
     // MARK: Prism
 
@@ -270,7 +272,18 @@ actor TestServers {
 
     func ensureHarness() async throws -> HarnessUrls {
         if let harnessUrls { return harnessUrls }
+        if let harnessStartError { throw harnessStartError }
+        do {
+            let urls = try await startHarness()
+            harnessUrls = urls
+            return urls
+        } catch {
+            harnessStartError = error
+            throw error
+        }
+    }
 
+    private func startHarness() async throws -> HarnessUrls {
         let bin = ContractSupport.harnessBin
         guard FileManager.default.fileExists(atPath: bin) else {
             throw ContractTestError.harnessStartFailed(
@@ -281,76 +294,55 @@ actor TestServers {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", bin, ContractSupport.specPath]
+        process.currentDirectoryURL = ContractSupport.packageRoot
+        process.environment = ProcessInfo.processInfo.environment
         let stdout = Pipe()
+        let stderr = Pipe()
         // The harness exits when its stdin closes — hold a pipe open.
         let stdin = Pipe()
         process.standardInput = stdin
         process.standardOutput = stdout
-        process.standardError = FileHandle.nullDevice
+        process.standardError = stderr
         try process.run()
         harnessProcess = process
         harnessStdin = stdin
+        harnessStderr = stderr
         ProcessReaper.shared.track(process)
 
-        // The service prints exactly one JSON line with its URLs.
-        let firstLine = LineCollector()
-        stdout.fileHandleForReading.readabilityHandler = { handle in
-            firstLine.append(handle.availableData)
-        }
-
-        let line = try await withTimeoutOrError(
-            15, ContractTestError.harnessStartFailed("harness service did not report URLs within 15s")
-        ) {
-            await firstLine.firstLine()
-        }
-        guard
-            let parsed = try? JSONCoding.decoder.decode(JSONValue.self, from: Data(line.utf8)),
-            let ws = parsed["wsUrl"]?.stringValue,
-            let control = parsed["controlUrl"]?.stringValue
-        else {
-            throw ContractTestError.harnessStartFailed("Unparseable harness URL line: \(line)")
-        }
-        let urls = HarnessUrls(wsUrl: ws, controlUrl: control)
-        harnessUrls = urls
-        return urls
-    }
-}
-
-/// Accumulates subprocess stdout and hands out the first complete line.
-final class LineCollector: @unchecked Sendable {
-    private let state = Locked<(buffer: Data, continuations: [CheckedContinuation<String, Never>], line: String?)>(
-        (Data(), [], nil)
-    )
-
-    func append(_ data: Data) {
-        guard !data.isEmpty else { return }
-        let resumptions: [(CheckedContinuation<String, Never>, String)] = state.withLock { state in
-            if state.line != nil { return [] }
-            state.buffer.append(data)
-            guard let newline = state.buffer.firstIndex(of: UInt8(ascii: "\n")) else { return [] }
-            let lineData = state.buffer[state.buffer.startIndex..<newline]
-            let line = String(decoding: lineData, as: UTF8.self)
-                .trimmingCharacters(in: .whitespaces)
-            state.line = line
-            let waiting = state.continuations
-            state.continuations = []
-            return waiting.map { ($0, line) }
-        }
-        for (continuation, line) in resumptions {
-            continuation.resume(returning: line)
-        }
-    }
-
-    func firstLine() async -> String {
-        if let line = state.withLock({ $0.line }) { return line }
-        return await withCheckedContinuation { continuation in
-            let ready: String? = state.withLock { state in
-                if let line = state.line { return line }
-                state.continuations.append(continuation)
-                return nil
+        // Poll the pipe. FileHandle.readabilityHandler is unreliable under
+        // `swift test` on GitHub-hosted macOS and can wait forever; each
+        // retry used to cost another 15s and starve the runner.
+        let deadline = Date().addingTimeInterval(15)
+        var buffer = Data()
+        while Date() < deadline {
+            if !process.isRunning {
+                let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                throw ContractTestError.harnessStartFailed(
+                    "harness service exited with code \(process.terminationStatus) before reporting URLs\n\(err)"
+                )
             }
-            if let ready { continuation.resume(returning: ready) }
+            let chunk = stdout.fileHandleForReading.availableData
+            if !chunk.isEmpty {
+                buffer.append(chunk)
+                if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                    let line = String(decoding: buffer[..<newline], as: UTF8.self)
+                        .trimmingCharacters(in: .whitespaces)
+                    guard
+                        let parsed = try? JSONCoding.decoder.decode(JSONValue.self, from: Data(line.utf8)),
+                        let ws = parsed["wsUrl"]?.stringValue,
+                        let control = parsed["controlUrl"]?.stringValue
+                    else {
+                        throw ContractTestError.harnessStartFailed("Unparseable harness URL line: \(line)")
+                    }
+                    return HarnessUrls(wsUrl: ws, controlUrl: control)
+                }
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
         }
+        let err = String(data: stderr.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+        throw ContractTestError.harnessStartFailed(
+            "harness service did not report URLs within 15s\n\(err)"
+        )
     }
 }
 
