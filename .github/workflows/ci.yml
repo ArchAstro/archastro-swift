@@ -32,7 +32,7 @@ jobs:
       - run: npm ci --ignore-scripts
 
       - name: Audit JS tooling dependencies
-        run: npm audit --audit-level=moderate
+        run: node scripts/audit-js-tooling.mjs
 
       - name: Swift version
         run: swift --version

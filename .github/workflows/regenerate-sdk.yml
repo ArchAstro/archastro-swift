@@ -48,7 +48,7 @@ jobs:
           npm install --package-lock-only --ignore-scripts
 
       - name: Audit JS tooling dependencies
-        run: npm audit --audit-level=moderate
+        run: node scripts/audit-js-tooling.mjs
 
       - name: Regenerate SDK
         env:
