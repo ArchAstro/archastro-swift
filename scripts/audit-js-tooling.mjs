@@ -29,6 +29,18 @@ const ALLOWED = {
       "--dynamic flag, so no Postman collection is parsed and faker generates " +
       "nothing. Prism is a devDependency and is never part of the published Swift package.",
   },
+  "GHSA-vfj7-8cjw-p6xm": {
+    package: "braces",
+    expires: "2026-12-31",
+    reason:
+      "Stack-exhaustion DoS when braces expands a deeply nested caller-supplied " +
+      "pattern. No patched release exists (all versions <= 3.0.3 affected). " +
+      "Reaches us only as chokidar 3.6.0 under @stoplight/prism-cli, which " +
+      "watches the single spec path we pass to `prism mock` with " +
+      "disableGlobbing: true (prism-cli dist/util/runner.js), so no pattern is " +
+      "ever expanded. Prism is a devDependency and is never part of the " +
+      "published Swift package. Re-review when braces ships a fix.",
+  },
 };
 
 function auditReport() {
