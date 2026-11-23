@@ -18,7 +18,8 @@ extension CustomObjectSubscription {
             while !Task.isCancelled {
                 try? await Task.sleep(for: interval)
                 guard !Task.isCancelled else { return }
-                await self?.resendPresence()
+                guard let self else { return }
+                await self.resendPresence()
             }
         }
     }
@@ -41,7 +42,7 @@ extension CustomObjectSubscription {
         try await waiter.value()
     }
 
-    private func schedulePresenceFlush() {
+    func schedulePresenceFlush() {
         guard presenceFlushTask == nil, !presenceSending, pendingPresence != nil else { return }
         let wait: Duration = lastPresenceSentAt.map { Self.presenceInterval - ($0.duration(to: .now)) } ?? .zero
         presenceFlushTask = Task { [weak self] in
@@ -63,12 +64,15 @@ extension CustomObjectSubscription {
         pendingPresence = nil
         presenceSending = true
         lastPresenceSentAt = .now
+        let generation = generation
         do {
             try await Self.sendPresence(channel, presence)
             for waiter in waiters { waiter.resolve() }
         } catch {
-            let classified = CustomObjectSubscriptionError.classify(error)
-            if classified.isTerminal {
+            let classified = endedWith ?? CustomObjectSubscriptionError.classify(error)
+            if endedWith != nil {
+                // Closed meanwhile: settle, nothing to recover.
+            } else if classified.isTerminal {
                 options.onError(classified)
                 terminate(classified)
             } else if case .network = classified {
@@ -100,9 +104,7 @@ extension CustomObjectSubscription {
     static func sendPresence(_ channel: ApiObjectChannel, _ presence: CustomObjectPresenceUpdate) async throws {
         let reply = try await channel.presenceUpdate(payload: .init(presence: presence.wire.objectValue ?? [:]))
         guard reply.status != "ok" else { return }
-        let reason = reply.response["reason"]?.stringValue ?? reply.response["code"]?.stringValue
-            ?? reply.response["error"]?.stringValue ?? reply.response.stringValue
-        if reason == "rate_limited" { return }
+        if CustomObjectSubscriptionError.reasonCode(reply.response) == "rate_limited" { return }
         throw CustomObjectSubscriptionError.fromReply(reply.response)
     }
 }

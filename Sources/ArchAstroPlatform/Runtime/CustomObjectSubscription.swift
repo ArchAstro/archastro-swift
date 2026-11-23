@@ -102,6 +102,9 @@ public actor CustomObjectSubscription {
     private(set) var channel: ApiObjectChannel?
     private var transportUnsubscribers: [@Sendable () -> Void] = []
     private var reconnectTask: Task<Void, Never>?
+    /// Why the subscription ended (close or a terminal error). Work that
+    /// resumes after an await settles with this instead of re-queueing.
+    private(set) var endedWith: CustomObjectSubscriptionError?
     private var reconnectAttempt = 0
     private(set) var generation = 0
     private var connecting = false
@@ -138,32 +141,31 @@ public actor CustomObjectSubscription {
             return try await enqueue(fields)
         }
         let operationId = Self.newOperationId()
-        let reply: ChannelReply
+        let generation = generation
+        var failure: CustomObjectSubscriptionError
         do {
-            reply = try await channel.updateFields(payload: .init(fields: fields, operationId: operationId))
+            let reply = try await channel.updateFields(payload: .init(fields: fields, operationId: operationId))
+            if reply.status == "ok" { return }
+            failure = .fromReply(reply.response)
         } catch {
-            let classified = CustomObjectSubscriptionError.classify(error)
-            guard !classified.isTerminal else {
-                options.onError(classified)
-                terminate(classified)
-                throw classified
-            }
-            // The send may have landed: keep its id so a replay dedupes.
-            let waiter = SubscriptionPromise()
-            if let rejection = queueRejection() {
-                waiter.reject(rejection)
-            } else {
-                queued.append(QueuedPatch(fields: fields, operationId: operationId, sent: true, waiter: waiter))
-            }
-            handleTransportLoss(classified, generation: generation)
-            return try await waiter.value()
+            failure = .classify(error)
         }
-        guard reply.status == "ok" else {
-            let classified = CustomObjectSubscriptionError.fromReply(reply.response)
-            options.onError(classified)
-            if classified.isTerminal { terminate(classified) }
-            throw classified
+        if let endedWith { throw endedWith }
+        guard case .network = failure else {
+            options.onError(failure)
+            if failure.isTerminal { terminate(failure) }
+            throw failure
         }
+        // The send may have landed: keep its id so a replay dedupes. It was
+        // sent before anything queued since, so it replays first.
+        let waiter = SubscriptionPromise()
+        if let rejection = queueRejection() {
+            waiter.reject(rejection)
+        } else {
+            queued.insert(QueuedPatch(fields: fields, operationId: operationId, sent: true, waiter: waiter), at: 0)
+        }
+        handleTransportLoss(failure, generation: generation)
+        try await waiter.value()
     }
 
     /// Publish this client's cursor, selection and activity (throttled to
@@ -182,6 +184,7 @@ public actor CustomObjectSubscription {
         guard state == .live, let channel else {
             throw CustomObjectSubscriptionError.network("Cannot save while the subscription is not live")
         }
+        let generation = generation
         let classified: CustomObjectSubscriptionError
         do {
             let reply = try await channel.save()
@@ -190,6 +193,7 @@ public actor CustomObjectSubscription {
         } catch {
             classified = .classify(error)
         }
+        if let endedWith { throw endedWith }
         if classified.isTerminal {
             options.onError(classified)
             terminate(classified)
@@ -203,11 +207,13 @@ public actor CustomObjectSubscription {
 
     public func close() {
         guard state != .closed else { return }
+        let closed = CustomObjectSubscriptionError.network("Custom-object subscription was closed")
+        endedWith = endedWith ?? closed
         generation += 1
         reconnectTask?.cancel()
         reconnectTask = nil
         transition(.closed)
-        rejectQueued(.network("Custom-object subscription was closed"))
+        rejectQueued(closed)
         disposeTransport(graceful: true)
     }
 
@@ -260,10 +266,13 @@ public actor CustomObjectSubscription {
             try await replayQueuedPatches(generation: generation)
             guard generation == self.generation, !isTerminal else { return }
             reconnectAttempt = 0
-            if lastPresence != nil { lastPresenceSentAt = .now }
             transition(.live)
             if let lastPresence {
-                try await Self.sendPresence(channel, lastPresence)
+                // Through the publisher, whose error handling only reconnects
+                // on transport loss: a refused presence must not undo the join.
+                lastPresenceSentAt = nil
+                pendingPresence = lastPresence
+                schedulePresenceFlush()
                 startPresenceHeartbeat()
             }
         } catch {
@@ -318,6 +327,10 @@ public actor CustomObjectSubscription {
             },
             channel.onPresenceLeft { payload in
                 hop { $0.options.onPresenceLeave?(CustomObjectPresenceLeave(connectionId: payload.connectionId)) }
+            },
+            // The server-side channel crashed while the socket stayed up.
+            channel.channel.on("phx_error") { _ in
+                hop { $0.handleTransportLoss(.network("channel error"), generation: generation) }
             },
         ]
     }
@@ -393,6 +406,12 @@ public actor CustomObjectSubscription {
                 queued.insert(patch, at: 0)
                 throw classified
             }
+            if case .network = classified {
+                // Temporary (the object's server restarted): keep the batch,
+                // unchanged under its id, and reconnect.
+                queued.insert(patch, at: 0)
+                throw classified
+            }
             // A refused batch (readonly, validation) cannot succeed on retry.
             options.onError(classified)
             for waiter in patch.waiters { waiter.reject(classified) }
@@ -421,6 +440,9 @@ public actor CustomObjectSubscription {
 
     private func scheduleReconnect() {
         guard !isTerminal, reconnectTask == nil else { return }
+        // Supersede an in-flight connect(): it must not go live on the
+        // transport torn down here.
+        generation += 1
         disposeTransport(graceful: false)
         transition(.reconnecting)
         let base = min(0.25 * pow(2, Double(reconnectAttempt)), options.maxReconnectDelay)
@@ -435,6 +457,11 @@ public actor CustomObjectSubscription {
 
     private func fireReconnect() async {
         reconnectTask = nil
+        if connecting {
+            // A superseded attempt is still unwinding; try again later.
+            scheduleReconnect()
+            return
+        }
         await connect(reconnecting: true)
     }
 
@@ -464,6 +491,7 @@ public actor CustomObjectSubscription {
     }
 
     func terminate(_ error: CustomObjectSubscriptionError) {
+        endedWith = endedWith ?? error
         generation += 1
         reconnectTask?.cancel()
         reconnectTask = nil
