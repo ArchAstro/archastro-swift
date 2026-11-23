@@ -76,6 +76,9 @@ final class FakePhoenixServer: @unchecked Sendable {
     let muteHeartbeats = Locked(false)
     let transports = Locked<[FakeTransport]>([])
     let joins = Locked<[(topic: String, payload: JSONValue)]>([])
+    /// Answers a frame first when set; nil falls through to the defaults.
+    /// Arguments: joinRef, ref, topic, event, payload.
+    let custom = Locked<(@Sendable (String?, String?, String, String, JSONValue) -> [String]?)?>(nil)
 
     var factory: PhxTransportFactory {
         { [self] url in
@@ -97,6 +100,9 @@ final class FakePhoenixServer: @unchecked Sendable {
         let topic = frame[2].stringValue ?? ""
         let event = frame[3].stringValue ?? ""
         let payload = frame[4]
+        if let custom = custom.withLock({ $0 }), let replies = custom(joinRef, ref, topic, event, payload) {
+            return replies
+        }
         switch event {
         case "phx_join":
             let count = joins.withLock { joins -> Int in

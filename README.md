@@ -90,6 +90,36 @@ channel.on(Channel.rejoinedEvent) { snapshot in /* authoritative state after a r
 In-flight pushes fail with `ChannelError.notConnected` when the connection
 drops. Pass `autoReconnect: false` to manage reconnects yourself.
 
+### Custom-object collaboration
+
+`CustomObjectSubscriptions` is the managed realtime layer over
+`ApiObjectChannel`, ported from `@archastro/sdk` (see its
+`docs/custom-object-collaboration.md`):
+
+```swift
+let realtime = CustomObjectSubscriptions {
+    // One socket per connection attempt, so each carries a fresh token.
+    Socket(url: socketURL, paramsProvider: { ["token": try await tokens.fresh()] }, autoReconnect: false)
+}
+let subscription = realtime.subscribe(.init(
+    objectId: "obj_123",
+    onSnapshot: { snapshot in /* authoritative fields; also after every reconnect */ },
+    onUpdate: { update in /* partial: deep-merge update.fields */ },
+    onStateChange: { state in /* connecting, live, reconnecting, unauthorized, closed */ },
+    onError: { error in /* CustomObjectSubscriptionError */ }
+))
+try await subscription.update(["layout": ["x": 10]])  // queued while offline, replayed after the snapshot
+try await subscription.updatePresence(.init(cursor: .init(x: 4, y: 2), selectedElementIds: [], activity: .active))
+await subscription.close()
+```
+
+- Offline updates coalesce (deep merge) into one batch; each batch carries an
+  `operation_id`, which the server uses to dedupe a replay.
+- `unauthorized`/`forbidden` and `not_found`/`deleted` are terminal; transport
+  loss reconnects with backoff (250 ms × 2ⁿ, capped at 10 s, plus jitter).
+- Presence is throttled to one send per 50 ms and refreshed every 25 s.
+- Keep the subscription: releasing it drops its socket.
+
 ## Project structure
 
 - `Sources/ArchAstroPlatform/Generated/` — **generated, do not edit.**
