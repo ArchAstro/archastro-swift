@@ -39,13 +39,18 @@ public final class Channel: @unchecked Sendable {
         case closed, joining, joined, leaving, errored
     }
 
-    private let socket: Socket
+    /// Weak: the socket owns its channels; a channel must not keep a
+    /// dropped socket (and its reconnect loop) alive.
+    private weak var socket: Socket?
     public let topic: String
 
     private struct Internals {
         var state: Channel.State = .closed
         var joinRef: String?
         var joinPayload: JSONValue = .object([:])
+        /// The join in flight. A second join() or a reconnect's rejoin()
+        /// awaits it instead of sending another phx_join.
+        var inFlightJoin: Task<JSONValue, any Error>?
         var pendingReplies: [String: CheckedContinuation<JSONValue, any Error>] = [:]
         var eventHandlers: [String: [(id: Int, callback: @Sendable (JSONValue) -> Void)]] = [:]
         var handlerCounter = 0
@@ -53,7 +58,6 @@ public final class Channel: @unchecked Sendable {
         // replayed to the first handler so autoPush-on-join can't be
         // missed. Bounded per event.
         var pendingPushes: [String: [JSONValue]] = [:]
-        var hasJoined = false
     }
 
     /// Delivered to `on(Channel.rejoinedEvent)` with the join response each
@@ -75,78 +79,122 @@ public final class Channel: @unchecked Sendable {
 
     public var isJoined: Bool { state == .joined }
 
+    private func liveSocket() throws -> Socket {
+        guard let socket else { throw ChannelError.notConnected("Socket was released") }
+        return socket
+    }
+
     // MARK: Join / leave
 
     /// Join the channel; returns the server's join response payload.
     /// Throws `ChannelError` if the join is rejected, times out, or the
-    /// channel is already joined.
+    /// channel is already joined. While a join is in flight, a second call
+    /// awaits that join.
     public func join(
         _ payload: JSONValue? = nil,
         timeout: TimeInterval? = nil
     ) async throws -> JSONValue {
+        let socket = try liveSocket()
         let effectiveTimeout = timeout ?? socket.timeout
         let ref = socket.makeRef()
-
-        try internals.withLock { state in
+        let task = try internals.withLock { state -> Task<JSONValue, any Error> in
+            if let inFlight = state.inFlightJoin { return inFlight }
             if state.state == .joined {
                 throw ChannelError.alreadyJoined(
                     "Channel \(topic) is already joined; call leave() first"
                 )
             }
-            state.state = .joining
-            state.joinRef = ref
             if let payload { state.joinPayload = payload }
+            return startJoin(&state, ref: ref, timeout: effectiveTimeout, rejoin: false)
         }
-
-        let envelope: JSONValue
-        do {
-            envelope = try await sendAndAwaitReply(
-                joinRef: ref, ref: ref, event: "phx_join",
-                payload: internals.withLock { $0.joinPayload },
-                timeout: effectiveTimeout,
-                timeoutMessage: "Join timed out for \(topic)"
-            )
-        } catch {
-            internals.withLock { $0.state = .errored }
-            throw error
-        }
-
-        if envelope["status"]?.stringValue == "ok" {
-            let response = envelope["response"] ?? .object([:])
-            let rejoined = internals.withLock { state -> Bool in
-                state.state = .joined
-                defer { state.hasJoined = true }
-                return state.hasJoined
-            }
-            if rejoined { trigger(event: Channel.rejoinedEvent, payload: response) }
-            return response
-        }
-        internals.withLock { $0.state = .errored }
-        throw ChannelError.joinRejected(envelope["response"] ?? .null)
+        return try await task.value
     }
 
     /// Rejoin with the last join payload after the socket reconnects, as
     /// @archastro/sdk Channel.rejoin does. A closed or leaving channel stays
-    /// put; a failed rejoin leaves the channel errored.
+    /// put; a failed rejoin leaves the channel errored. The eligibility
+    /// check and the move to `.joining` share one lock section, so a
+    /// concurrent leave() wins cleanly.
     func rejoin() async {
-        let eligible = internals.withLock { state -> Bool in
-            guard state.state != .closed, state.state != .leaving else { return false }
-            state.state = .closed
-            state.joinRef = nil
-            return true
+        guard let socket else { return }
+        let ref = socket.makeRef()
+        let timeout = socket.timeout
+        let task = internals.withLock { state -> Task<JSONValue, any Error>? in
+            if let inFlight = state.inFlightJoin { return inFlight }
+            guard state.state == .joined || state.state == .errored else { return nil }
+            return startJoin(&state, ref: ref, timeout: timeout, rejoin: true)
         }
-        guard eligible else { return }
+        _ = try? await task?.value
+    }
+
+    /// Under the internals lock: mark joining and start the phx_join.
+    private func startJoin(
+        _ state: inout Internals,
+        ref: String,
+        timeout: TimeInterval,
+        rejoin: Bool
+    ) -> Task<JSONValue, any Error> {
+        state.state = .joining
+        state.joinRef = ref
+        let payload = state.joinPayload
+        let task = Task { [self] in
+            try await performJoin(ref: ref, payload: payload, timeout: timeout, rejoin: rejoin)
+        }
+        state.inFlightJoin = task
+        return task
+    }
+
+    private func performJoin(
+        ref: String,
+        payload: JSONValue,
+        timeout: TimeInterval,
+        rejoin: Bool
+    ) async throws -> JSONValue {
+        // Only the join that is still current may move the state.
+        func settle(_ next: Channel.State) -> Bool {
+            internals.withLock { state in
+                guard state.joinRef == ref else { return false }
+                state.inFlightJoin = nil
+                if state.state == .joining { state.state = next }
+                return state.state == next
+            }
+        }
+        let envelope: JSONValue
         do {
-            _ = try await join()
+            envelope = try await sendAndAwaitReply(
+                joinRef: ref, ref: ref, event: "phx_join",
+                payload: payload,
+                timeout: timeout,
+                timeoutMessage: "Join timed out for \(topic)"
+            )
         } catch {
-            internals.withLock { $0.state = .errored }
+            _ = settle(.errored)
+            throw error
         }
+        guard envelope["status"]?.stringValue == "ok" else {
+            _ = settle(.errored)
+            throw ChannelError.joinRejected(envelope["response"] ?? .null)
+        }
+        let response = envelope["response"] ?? .object([:])
+        if settle(.joined), rejoin {
+            trigger(event: Channel.rejoinedEvent, payload: response)
+        }
+        return response
     }
 
     /// Leave the channel (best-effort — a timeout is swallowed).
     public func leave(timeout: TimeInterval? = nil) async throws {
-        if state == .closed { return }
-        internals.withLock { $0.state = .leaving }
+        let proceed = internals.withLock { state -> Bool in
+            guard state.state != .closed else { return false }
+            state.state = .leaving
+            state.inFlightJoin = nil
+            return true
+        }
+        guard proceed else { return }
+        guard let socket else {
+            finishLeave()
+            return
+        }
 
         let ref = socket.makeRef()
         let currentJoinRef = internals.withLock { $0.joinRef }
@@ -173,7 +221,7 @@ public final class Channel: @unchecked Sendable {
             state.state = .closed
             state.joinRef = nil
         }
-        socket.removeChannel(topic)
+        socket?.removeChannel(topic)
     }
 
     // MARK: Push / reply
@@ -185,6 +233,7 @@ public final class Channel: @unchecked Sendable {
         timeout: TimeInterval? = nil
     ) async throws -> ChannelReply {
         let payloadJSON = try JSONValue(encodable: payload)
+        let socket = try liveSocket()
         let ref = socket.makeRef()
         let currentJoinRef = internals.withLock { $0.joinRef }
         let envelope = try await sendAndAwaitReply(
@@ -213,9 +262,14 @@ public final class Channel: @unchecked Sendable {
                     self.internals.withLock {
                         $0.pendingReplies[ref] = continuation
                     }
+                    // onCancel may have run before the continuation existed.
+                    if Task.isCancelled {
+                        self.failPending(ref: ref, error: ChannelError.timeout(timeoutMessage))
+                        return
+                    }
                     Task {
                         do {
-                            try await self.socket.send(
+                            try await self.liveSocket().send(
                                 joinRef: joinRef, ref: ref, topic: self.topic,
                                 event: event, payload: payload
                             )
@@ -306,8 +360,12 @@ public final class Channel: @unchecked Sendable {
         let continuations = internals.withLock { state in
             let pending = state.pendingReplies
             state.pendingReplies = [:]
+            // Retire the in-flight join: its reply can no longer arrive, and
+            // a reconnect's rejoin() must start a fresh one.
+            state.inFlightJoin = nil
             if state.state != .closed, state.state != .leaving {
                 state.state = .errored
+                state.joinRef = nil
             }
             return pending
         }
