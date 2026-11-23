@@ -53,6 +53,7 @@ public final class Channel: @unchecked Sendable {
         var inFlightJoin: Task<JSONValue, any Error>?
         var pendingReplies: [String: CheckedContinuation<JSONValue, any Error>] = [:]
         var eventHandlers: [String: [(id: Int, callback: @Sendable (JSONValue) -> Void)]] = [:]
+        var anyHandlers: [(id: Int, callback: @Sendable (String, JSONValue) -> Void)] = []
         var handlerCounter = 0
         // Inbound pushes that arrived before a handler was registered —
         // replayed to the first handler so autoPush-on-join can't be
@@ -316,6 +317,23 @@ public final class Channel: @unchecked Sendable {
         }
     }
 
+    /// Observe every server push on this topic (not replies or
+    /// `phx_*` lifecycle events), e.g. to bridge into another event stream.
+    /// Prefer `on(_:)` or the generated typed handlers. Register before
+    /// `join` to see pushes the server sends on join; the per-event buffer
+    /// for late `on(_:)` handlers is unaffected.
+    @discardableResult
+    public func onAny(_ callback: @escaping @Sendable (_ event: String, _ payload: JSONValue) -> Void) -> @Sendable () -> Void {
+        let id = internals.withLock { state -> Int in
+            state.handlerCounter += 1
+            state.anyHandlers.append((id: state.handlerCounter, callback: callback))
+            return state.handlerCounter
+        }
+        return { [weak self] in
+            self?.internals.withLock { $0.anyHandlers.removeAll { $0.id == id } }
+        }
+    }
+
     // MARK: Inbound dispatch
 
     func onMessage(joinRef: String?, ref: String?, event: String, payload: JSONValue) {
@@ -338,7 +356,7 @@ public final class Channel: @unchecked Sendable {
             internals.withLock { $0.state = .errored }
             trigger(event: "phx_error", payload: payload)
         default:
-            let handlers = internals.withLock { state -> [(id: Int, callback: @Sendable (JSONValue) -> Void)] in
+            let (handlers, anyHandlers) = internals.withLock { state -> ([(id: Int, callback: @Sendable (JSONValue) -> Void)], [(id: Int, callback: @Sendable (String, JSONValue) -> Void)]) in
                 let registered = state.eventHandlers[event] ?? []
                 if registered.isEmpty {
                     var buffer = state.pendingPushes[event, default: []]
@@ -348,7 +366,10 @@ public final class Channel: @unchecked Sendable {
                     buffer.append(payload)
                     state.pendingPushes[event] = buffer
                 }
-                return registered
+                return (registered, state.anyHandlers)
+            }
+            for handler in anyHandlers {
+                handler.callback(event, payload)
             }
             for handler in handlers {
                 handler.callback(payload)
