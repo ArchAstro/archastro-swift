@@ -118,6 +118,7 @@ import Testing
                   "data": [{
                     "id": "thr_room",
                     "visibility": "default",
+                    "archive_state": {"type": "active"},
                     "creator": "usr_creator"
                   }]
                 }
@@ -137,6 +138,7 @@ import Testing
                   "data": [{
                     "id": "thr_room",
                     "visibility": "default",
+                    "archive_state": {"type": "active"},
                     "creator": {
                       "id": "usr_creator",
                       "name": "Creator"
