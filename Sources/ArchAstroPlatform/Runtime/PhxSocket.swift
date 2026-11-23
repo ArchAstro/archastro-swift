@@ -37,6 +37,16 @@ public protocol PhxTransport: Sendable {
     func close(code: Int, reason: String)
 }
 
+/// Thrown by `PhxTransport.open()` when the server answers the WebSocket
+/// upgrade with an HTTP error (Phoenix refuses a bad token with 403).
+public struct PhxTransportRejected: Error, Sendable, Equatable {
+    public let status: Int
+
+    public init(status: Int) {
+        self.status = status
+    }
+}
+
 /// Thrown by `PhxTransport.receive()` when the connection ends.
 public struct PhxTransportClosed: Error, Sendable, Equatable {
     public let code: Int
@@ -71,8 +81,12 @@ public final class URLSessionPhxTransport: PhxTransport, @unchecked Sendable {
 
     private func ping() async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
-            task.sendPing { error in
+            task.sendPing { [task] error in
                 if let error {
+                    if let status = (task.response as? HTTPURLResponse)?.statusCode, status >= 400 {
+                        cont.resume(throwing: PhxTransportRejected(status: status))
+                        return
+                    }
                     cont.resume(throwing: PlatformClientError.connectionFailed(String(describing: error)))
                 } else {
                     cont.resume(returning: ())
