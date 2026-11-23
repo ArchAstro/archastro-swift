@@ -114,14 +114,23 @@ public enum CustomObjectSubscriptionError: Error, Sendable, Equatable {
         }
     }
 
+    /// The reason code of a failed reply. The server's catch-all replies
+    /// `inspect(atom)`, so `:rate_limited` and `rate_limited` are one code.
+    static func reasonCode(_ response: JSONValue) -> String {
+        let raw = response["reason"]?.stringValue ?? response["code"]?.stringValue
+            ?? response["error"]?.stringValue ?? response.stringValue ?? "unknown"
+        return raw.hasPrefix(":") ? String(raw.dropFirst()) : raw
+    }
+
     /// A failed reply `{reason: ...}` from the object channel.
     static func fromReply(_ response: JSONValue) -> CustomObjectSubscriptionError {
-        let reason = response["reason"]?.stringValue ?? response.stringValue ?? "unknown"
+        let reason = reasonCode(response)
         switch reason {
         case "unauthorized", "forbidden": return .authorization(code: reason)
         case "not_found", "deleted": return .notFound(code: reason)
         case "validation": return .validation(code: reason, details: response["validation_errors"])
-        case "object_unavailable": return .network("object_unavailable")
+        // The object's server process went away; it comes back on rejoin.
+        case "object_unavailable", "room_unavailable": return .network(reason)
         default: return .rejected(code: reason)
         }
     }

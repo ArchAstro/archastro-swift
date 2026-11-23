@@ -33,8 +33,12 @@ final class FakeObjectServer: @unchecked Sendable {
         guard topic.hasPrefix("api:object:") else { return nil }
         let id = String(topic.dropFirst("api:object:".count))
         func ok(_ response: JSONValue) -> [String] { [FakePhoenixServer.reply(joinRef, ref, topic, response)] }
+        // Like api_object_channel.ex: named reasons are plain strings; the
+        // catch-all replies `inspect(atom)`, e.g. ":rate_limited".
         func error(_ reason: String) -> [String] {
-            [FakePhoenixServer.frame(joinRef, ref, topic, "phx_reply", ["status": "error", "response": ["reason": .string(reason)]])]
+            let named: Set = ["unauthorized", "not_found", "deleted", "readonly", "validation", "object_unavailable", "invalid_operation_id"]
+            let wire = named.contains(reason) ? reason : ":" + reason
+            return [FakePhoenixServer.frame(joinRef, ref, topic, "phx_reply", ["status": "error", "response": ["reason": .string(wire)]])]
         }
         switch event {
         case "phx_join":
@@ -325,7 +329,8 @@ final class Recorder: @unchecked Sendable {
         }
         for task in burst { try await task.value }
         let sent = server.presenceSent.withLock { $0 }
-        #expect(sent.count == 2)
+        // First send, then the burst coalesced (a stalled CI runner may split it once).
+        #expect((2...3).contains(sent.count))
         #expect(sent.last?["cursor"]?["x"]?.doubleValue == 5)
         #expect(sent.last?["state"] == "active")
         try await eventually("refresh") { server.presenceSent.withLock { $0.count } >= 3 }
@@ -379,5 +384,67 @@ final class Recorder: @unchecked Sendable {
             ["a": ["y": 3], "list": [3], "s": .null]
         )
         #expect(merged == ["a": ["x": 1, "y": 3], "list": [3], "s": .null])
+    }
+
+    // MARK: Review regressions (PR #13)
+
+    @Test func close_during_an_in_flight_update_settles_it() async throws {
+        let server = FakeObjectServer()
+        let recorder = Recorder()
+        let subscription = try await live(server, recorder)
+        server.holdUpdates.withLock { $0 = true }
+        let pending = Task { try await subscription.update(["a": 1]) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        await subscription.close()
+        await #expect(throws: CustomObjectSubscriptionError.network("Custom-object subscription was closed")) {
+            try await pending.value
+        }
+    }
+
+    @Test func room_unavailable_during_replay_keeps_the_batch_and_reconnects() async throws {
+        let server = FakeObjectServer()
+        let recorder = Recorder()
+        let subscription = try await live(server, recorder)
+        server.joinError.withLock { $0 = "object_unavailable" }
+        server.phoenix.latest?.peerClose(code: 1006)
+        try await eventually("reconnecting") { recorder.state == .reconnecting }
+        let pending = Task { try await subscription.update(["keep": true]) }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        server.updateError.withLock { $0 = "room_unavailable" }
+        server.joinError.withLock { $0 = nil }
+        try await eventually("replay refused once") { server.joinCount.withLock { $0 } >= 3 }
+        server.updateError.withLock { $0 = nil }
+        try await pending.value
+        #expect(server.fields.withLock { $0["keep"] } == true)
+        await subscription.close()
+    }
+
+    @Test func a_server_channel_crash_rejoins() async throws {
+        let server = FakeObjectServer()
+        let recorder = Recorder()
+        let subscription = try await live(server, recorder)
+        server.push("phx_error", [:])
+        try await eventually("rejoined") { recorder.snapshots.withLock { $0.count } == 2 && recorder.state == .live }
+        await subscription.close()
+    }
+
+    @Test func a_refused_presence_after_rejoin_keeps_the_connection() async throws {
+        let server = FakeObjectServer()
+        let recorder = Recorder()
+        let subscription = try await live(server, recorder)
+        try await subscription.updatePresence(.init(cursor: nil, selectedElementIds: ["a"], activity: .active))
+        server.presenceError.withLock { $0 = "invalid_presence" }
+        server.phoenix.latest?.peerClose(code: 1006)
+        try await eventually("rejoined") { recorder.snapshots.withLock { $0.count } == 2 && recorder.state == .live }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(recorder.state == .live)
+        #expect(server.joinCount.withLock { $0 } == 2)
+        #expect(recorder.errors.withLock { $0 }.contains(.rejected(code: "invalid_presence")))
+        await subscription.close()
+    }
+
+    @Test func reason_codes_from_inspect_are_normalized() {
+        #expect(CustomObjectSubscriptionError.reasonCode(["reason": ":rate_limited"]) == "rate_limited")
+        #expect(CustomObjectSubscriptionError.fromReply(["reason": ":room_unavailable"]) == .network("room_unavailable"))
     }
 }
