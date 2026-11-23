@@ -67,6 +67,29 @@ Errors surface as `ApiError` (status, errorCode, message, body). Channel
 join failures throw `ChannelError`; push replies return a
 `ChannelReply(status:response:)` envelope.
 
+### Reconnect
+
+`Socket` mirrors `@archastro/sdk`: after a connection has opened, a drop
+(peer close, network loss, missed heartbeat) reconnects on the Phoenix
+backoff schedule (10 ms … 2 s) and rejoins every joined or errored channel
+with its last join payload. The first `connect()` still throws on failure.
+
+```swift
+let socket = Socket(
+    url: "wss://platform.archastro.ai/socket/api/websocket",
+    paramsProvider: { ["token": try await session.freshAccessToken()] } // per (re)connect
+)
+socket.onEvent { event in
+    if case .close(let code, _) = event { print("closed", code) } // then .open on reconnect
+}
+try await socket.connect()
+let channel = socket.channel("api:object:\(objectId)")
+channel.on(Channel.rejoinedEvent) { snapshot in /* authoritative state after a rejoin */ }
+```
+
+In-flight pushes fail with `ChannelError.notConnected` when the connection
+drops. Pass `autoReconnect: false` to manage reconnects yourself.
+
 ## Project structure
 
 - `Sources/ArchAstroPlatform/Generated/` — **generated, do not edit.**
@@ -74,7 +97,7 @@ join failures throw `ChannelError`; push replies return a
   (`V1/`), channels (`Channels/`), `Client.swift`, `Auth.swift`.
 - `Sources/ArchAstroPlatform/Runtime/` — hand-maintained runtime:
   `HttpClient` (auth headers, one-shot 401 refresh, `ApiError`, SSE),
-  `JSONValue`, and the Phoenix channel client (`Socket`, `Channel`).
+  `JSONValue`, and the Phoenix client (`Socket` in `PhxSocket.swift`, `Channel`).
 - `Tests/ArchAstroPlatformTests/` — hand-written runtime unit tests.
 - `Tests/ArchAstroPlatformContractTests/` — **generated** contract tests
   (`V1/`, `Channels/`, `Streams/`) plus the hand-maintained `Support/`

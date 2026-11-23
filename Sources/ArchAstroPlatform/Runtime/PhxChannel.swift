@@ -3,7 +3,8 @@
 
 // Runtime: Phoenix Channels client for the generated Platform SDK.
 // This file is hand-maintained, not generated. Port of the Python SDK's
-// archastro/phx_channel package.
+// archastro/phx_channel package; reconnect and rejoin follow
+// @archastro/sdk phx_channel (socket.ts, channel.ts). Socket: PhxSocket.swift.
 //
 // Wire protocol: JSON arrays [join_ref, ref, topic, event, payload]
 
@@ -32,252 +33,6 @@ public enum ChannelError: Error, Sendable {
     case transport(String)
 }
 
-/// Manages a WebSocket connection to a Phoenix server: heartbeat, refs,
-/// and per-topic channels.
-public final class Socket: @unchecked Sendable {
-    public static let defaultHeartbeatInterval: TimeInterval = 30
-    public static let defaultTimeout: TimeInterval = 10
-
-    private let urlString: String
-    private let params: [String: String]
-    private let heartbeatInterval: TimeInterval
-    let timeout: TimeInterval
-    // Reserved for a future reconnect implementation; the SDK currently
-    // surfaces disconnects to callers instead of silently retrying.
-    private let autoReconnect: Bool
-
-    private struct State {
-        var task: URLSessionWebSocketTask?
-        var connected = false
-        var closing = false
-        var refCounter = 0
-        var channels: [String: Channel] = [:]
-        var pendingHeartbeatRef: String?
-        var receiveTask: Task<Void, Never>?
-        var heartbeatTask: Task<Void, Never>?
-    }
-
-    private let state = Locked(State())
-
-    public init(
-        url: String,
-        params: [String: String] = [:],
-        heartbeatInterval: TimeInterval = Socket.defaultHeartbeatInterval,
-        timeout: TimeInterval = Socket.defaultTimeout,
-        autoReconnect: Bool = true
-    ) {
-        self.urlString = url
-        self.params = params
-        self.heartbeatInterval = heartbeatInterval
-        self.timeout = timeout
-        self.autoReconnect = autoReconnect
-    }
-
-    public var isConnected: Bool {
-        state.withLock { $0.connected }
-    }
-
-    // MARK: Connection lifecycle
-
-    public func connect() async throws {
-        guard var components = URLComponents(string: urlString) else {
-            throw PlatformClientError.invalidURL(urlString)
-        }
-        var items = components.queryItems ?? []
-        for (key, value) in params.sorted(by: { $0.key < $1.key }) {
-            items.append(URLQueryItem(name: key, value: value))
-        }
-        items.append(URLQueryItem(name: "vsn", value: "2.0.0"))
-        components.queryItems = items
-        guard let url = components.url else {
-            throw PlatformClientError.invalidURL(urlString)
-        }
-
-        let task = URLSession.shared.webSocketTask(with: url)
-        state.withLock {
-            $0.task = task
-            $0.closing = false
-        }
-        task.resume()
-
-        // The handshake completes lazily; a ping round-trip confirms it.
-        try await withTimeoutOrError(timeout, ChannelError.timeout("Socket connect timed out")) {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
-                task.sendPing { error in
-                    if let error {
-                        cont.resume(
-                            throwing: PlatformClientError.connectionFailed(String(describing: error))
-                        )
-                    } else {
-                        cont.resume(returning: ())
-                    }
-                }
-            }
-        }
-
-        state.withLock { $0.connected = true }
-        startReceiveLoop(task)
-        startHeartbeatLoop()
-    }
-
-    public func disconnect() async {
-        let (task, receive, heartbeat) = state.withLock { state in
-            state.closing = true
-            state.connected = false
-            let result = (state.task, state.receiveTask, state.heartbeatTask)
-            state.task = nil
-            state.receiveTask = nil
-            state.heartbeatTask = nil
-            return result
-        }
-        receive?.cancel()
-        heartbeat?.cancel()
-        task?.cancel(with: .normalClosure, reason: nil)
-    }
-
-    // MARK: Channels
-
-    /// Create (or return the existing) channel for a topic.
-    public func channel(_ topic: String) -> Channel {
-        state.withLock { state in
-            if let existing = state.channels[topic] { return existing }
-            let channel = Channel(socket: self, topic: topic)
-            state.channels[topic] = channel
-            return channel
-        }
-    }
-
-    func removeChannel(_ topic: String) {
-        state.withLock { _ = $0.channels.removeValue(forKey: topic) }
-    }
-
-    func makeRef() -> String {
-        state.withLock { state in
-            state.refCounter += 1
-            return String(state.refCounter)
-        }
-    }
-
-    // MARK: Sending
-
-    func send(
-        joinRef: String?,
-        ref: String?,
-        topic: String,
-        event: String,
-        payload: JSONValue
-    ) async throws {
-        let (task, isConnected) = state.withLock { ($0.task, $0.connected) }
-        guard let task, isConnected else {
-            throw ChannelError.notConnected("Socket is not connected")
-        }
-        let frame: JSONValue = .array([
-            joinRef.map { .string($0) } ?? .null,
-            ref.map { .string($0) } ?? .null,
-            .string(topic),
-            .string(event),
-            payload,
-        ])
-        let data = try JSONCoding.encoder.encode(frame)
-        try await task.send(.string(String(decoding: data, as: UTF8.self)))
-    }
-
-    // MARK: Receive loop
-
-    private func startReceiveLoop(_ task: URLSessionWebSocketTask) {
-        let loop = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    let message = try await task.receive()
-                    let text: String
-                    switch message {
-                    case .string(let string):
-                        text = string
-                    case .data(let data):
-                        text = String(decoding: data, as: UTF8.self)
-                    @unknown default:
-                        continue
-                    }
-                    guard
-                        let parsed = try? JSONCoding.decoder.decode(
-                            JSONValue.self, from: Data(text.utf8)
-                        ),
-                        let frame = parsed.arrayValue,
-                        frame.count == 5
-                    else { continue }
-                    self?.dispatch(
-                        joinRef: frame[0].stringValue,
-                        ref: frame[1].stringValue,
-                        topic: frame[2].stringValue ?? "",
-                        event: frame[3].stringValue ?? "",
-                        payload: frame[4]
-                    )
-                } catch {
-                    self?.handleDisconnect()
-                    break
-                }
-            }
-        }
-        state.withLock { $0.receiveTask = loop }
-    }
-
-    private func handleDisconnect() {
-        let openChannels = state.withLock { state -> [Channel] in
-            state.connected = false
-            return Array(state.channels.values)
-        }
-        for channel in openChannels {
-            channel.handleSocketDisconnect()
-        }
-    }
-
-    private func dispatch(
-        joinRef: String?,
-        ref: String?,
-        topic: String,
-        event: String,
-        payload: JSONValue
-    ) {
-        let (isHeartbeatReply, channel) = state.withLock { state -> (Bool, Channel?) in
-            let heartbeat = ref != nil && ref == state.pendingHeartbeatRef
-            if heartbeat { state.pendingHeartbeatRef = nil }
-            return (heartbeat, state.channels[topic])
-        }
-        if isHeartbeatReply { return }
-        channel?.onMessage(joinRef: joinRef, ref: ref, event: event, payload: payload)
-    }
-
-    // MARK: Heartbeat
-
-    private func startHeartbeatLoop() {
-        let interval = heartbeatInterval
-        let loop = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                guard let self, self.isConnected, !Task.isCancelled else { break }
-
-                let stale = self.state.withLock { $0.pendingHeartbeatRef != nil }
-                if stale {
-                    // Previous heartbeat unacknowledged — connection is dead.
-                    await self.disconnect()
-                    break
-                }
-                let ref = self.makeRef()
-                self.state.withLock { $0.pendingHeartbeatRef = ref }
-                do {
-                    try await self.send(
-                        joinRef: nil, ref: ref, topic: "phoenix",
-                        event: "heartbeat", payload: .object([:])
-                    )
-                } catch {
-                    break
-                }
-            }
-        }
-        state.withLock { $0.heartbeatTask = loop }
-    }
-}
-
 /// A single Phoenix Channel subscription on a topic.
 public final class Channel: @unchecked Sendable {
     public enum State: String, Sendable {
@@ -290,6 +45,7 @@ public final class Channel: @unchecked Sendable {
     private struct Internals {
         var state: Channel.State = .closed
         var joinRef: String?
+        var joinPayload: JSONValue = .object([:])
         var pendingReplies: [String: CheckedContinuation<JSONValue, any Error>] = [:]
         var eventHandlers: [String: [(id: Int, callback: @Sendable (JSONValue) -> Void)]] = [:]
         var handlerCounter = 0
@@ -297,7 +53,13 @@ public final class Channel: @unchecked Sendable {
         // replayed to the first handler so autoPush-on-join can't be
         // missed. Bounded per event.
         var pendingPushes: [String: [JSONValue]] = [:]
+        var hasJoined = false
     }
+
+    /// Delivered to `on(Channel.rejoinedEvent)` with the join response each
+    /// time the socket rejoins this channel after a reconnect. Every join
+    /// response is the server's authoritative snapshot for the topic.
+    public static let rejoinedEvent = "phx_rejoined"
 
     private let internals = Locked(Internals())
     private let pendingPushCap = 32
@@ -333,13 +95,14 @@ public final class Channel: @unchecked Sendable {
             }
             state.state = .joining
             state.joinRef = ref
+            if let payload { state.joinPayload = payload }
         }
 
         let envelope: JSONValue
         do {
             envelope = try await sendAndAwaitReply(
                 joinRef: ref, ref: ref, event: "phx_join",
-                payload: payload ?? .object([:]),
+                payload: internals.withLock { $0.joinPayload },
                 timeout: effectiveTimeout,
                 timeoutMessage: "Join timed out for \(topic)"
             )
@@ -349,11 +112,35 @@ public final class Channel: @unchecked Sendable {
         }
 
         if envelope["status"]?.stringValue == "ok" {
-            internals.withLock { $0.state = .joined }
-            return envelope["response"] ?? .object([:])
+            let response = envelope["response"] ?? .object([:])
+            let rejoined = internals.withLock { state -> Bool in
+                state.state = .joined
+                defer { state.hasJoined = true }
+                return state.hasJoined
+            }
+            if rejoined { trigger(event: Channel.rejoinedEvent, payload: response) }
+            return response
         }
         internals.withLock { $0.state = .errored }
         throw ChannelError.joinRejected(envelope["response"] ?? .null)
+    }
+
+    /// Rejoin with the last join payload after the socket reconnects, as
+    /// @archastro/sdk Channel.rejoin does. A closed or leaving channel stays
+    /// put; a failed rejoin leaves the channel errored.
+    func rejoin() async {
+        let eligible = internals.withLock { state -> Bool in
+            guard state.state != .closed, state.state != .leaving else { return false }
+            state.state = .closed
+            state.joinRef = nil
+            return true
+        }
+        guard eligible else { return }
+        do {
+            _ = try await join()
+        } catch {
+            internals.withLock { $0.state = .errored }
+        }
     }
 
     /// Leave the channel (best-effort — a timeout is swallowed).
@@ -519,7 +306,9 @@ public final class Channel: @unchecked Sendable {
         let continuations = internals.withLock { state in
             let pending = state.pendingReplies
             state.pendingReplies = [:]
-            state.state = .errored
+            if state.state != .closed, state.state != .leaving {
+                state.state = .errored
+            }
             return pending
         }
         for (_, continuation) in continuations {
