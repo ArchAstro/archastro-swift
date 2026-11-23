@@ -375,4 +375,27 @@ func eventually(
         #expect(events.withLock { $0.last } == .close(code: 1006, reason: ""))
         #expect(transport?.localCloses.withLock { $0 } == [1000])
     }
+
+    @Test func on_any_sees_every_push_but_not_replies_or_lifecycle() async throws {
+        let server = FakePhoenixServer()
+        let socket = makeSocket(server)
+        try await socket.connect()
+        let channel = socket.channel("room:any")
+        let seen = Locked<[String]>([])
+        let stop = channel.onAny { event, payload in seen.withLock { $0.append("\(event)=\(payload["n"]?.intValue ?? -1)") } }
+        _ = try await channel.join()
+        server.latest?.push(topic: "room:any", event: "message_added", payload: ["n": 1])
+        server.latest?.push(topic: "room:any", event: "typing", payload: ["n": 2])
+        _ = try await channel.push("echo", payload: ["n": 3] as JSONValue)
+        try await eventually("pushes") { seen.withLock { $0.count } == 2 }
+        stop()
+        server.latest?.push(topic: "room:any", event: "message_added", payload: ["n": 4])
+        // A late named handler still gets the buffered first push.
+        let late = Locked<[Int]>([])
+        channel.on("typing") { payload in late.withLock { $0.append(payload["n"]?.intValue ?? -1) } }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        #expect(seen.withLock { $0 } == ["message_added=1", "typing=2"])
+        #expect(late.withLock { $0 } == [2])
+        await socket.disconnect()
+    }
 }
