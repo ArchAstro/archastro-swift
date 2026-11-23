@@ -18,6 +18,8 @@ final class FakeTransport: PhxTransport, @unchecked Sendable {
     private let feed: AsyncThrowingStream<String, any Error>.Continuation
     private let reader = Locked<AsyncThrowingStream<String, any Error>.AsyncIterator?>(nil)
     let closedWith = Locked<PhxTransportClosed?>(nil)
+    /// Close codes this side asked to send.
+    let localCloses = Locked<[Int]>([])
 
     init(url: URL, server: FakePhoenixServer) {
         self.url = url
@@ -48,6 +50,7 @@ final class FakeTransport: PhxTransport, @unchecked Sendable {
     }
 
     func close(code: Int, reason: String) {
+        localCloses.withLock { $0.append(code) }
         peerClose(code: code, reason: reason)
     }
 
@@ -240,7 +243,7 @@ func eventually(
         let socket = makeSocket(server, heartbeat: 0.02)
         let events = recorder(socket)
         try await socket.connect()
-        try await eventually("reconnect") { server.transports.withLock { $0.count } >= 2 }
+        try await eventually("reconnect") { events.withLock { $0.count } >= 3 }
         #expect(events.withLock { Array($0.prefix(3)) } == [.open, .close(code: 1000, reason: "heartbeat timeout"), .open])
         await socket.disconnect()
     }
@@ -283,5 +286,87 @@ func eventually(
         await #expect(throws: PlatformClientError.self) { try await socket.connect() }
         try await Task.sleep(nanoseconds: 50_000_000)
         #expect(server.transports.withLock { $0.count } == 1)
+    }
+
+    // MARK: Review regressions (PR #11)
+
+    @Test func connect_while_connected_opens_no_second_transport() async throws {
+        let server = FakePhoenixServer()
+        let socket = makeSocket(server)
+        try await socket.connect()
+        try await socket.connect()
+        #expect(server.transports.withLock { $0.count } == 1)
+        await socket.disconnect()
+    }
+
+    @Test func a_user_connect_during_backoff_leaves_one_live_transport() async throws {
+        let server = FakePhoenixServer()
+        let socket = Socket(
+            url: "ws://platform.test/socket", heartbeatInterval: 30, timeout: 1,
+            reconnectBackoff: [0.1], transport: server.factory
+        )
+        try await socket.connect()
+        server.latest?.peerClose(code: 1006)
+        try await eventually("drop") { !socket.isConnected }
+        try await socket.connect()
+        try await Task.sleep(nanoseconds: 250_000_000)
+        let live = server.transports.withLock { $0.filter { $0.closedWith.withLock { $0 } == nil } }
+        #expect(live.count == 1)
+        #expect(socket.isConnected)
+        await socket.disconnect()
+    }
+
+    @Test func concurrent_joins_share_one_phx_join() async throws {
+        let server = FakePhoenixServer()
+        let socket = makeSocket(server)
+        try await socket.connect()
+        let channel = socket.channel("room:shared")
+        async let first = channel.join(["n": 1])
+        async let second = channel.join(["n": 1])
+        let (a, b) = try await (first, second)
+        #expect(a == b)
+        #expect(server.joins.withLock { $0.count } == 1)
+        #expect(channel.state == .joined)
+        await socket.disconnect()
+    }
+
+    @Test func a_manual_rejoin_after_leave_is_not_reported_as_a_reconnect_rejoin() async throws {
+        let server = FakePhoenixServer()
+        let socket = makeSocket(server)
+        try await socket.connect()
+        let channel = socket.channel("room:manual")
+        let rejoins = Locked(0)
+        channel.on(Channel.rejoinedEvent) { _ in rejoins.withLock { $0 += 1 } }
+        _ = try await channel.join()
+        try await channel.leave()
+        _ = try await socket.channel("room:manual").join()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        #expect(rejoins.withLock { $0 } == 0)
+        await socket.disconnect()
+    }
+
+    @Test func releasing_the_socket_closes_its_transport_and_stops_reconnecting() async throws {
+        let server = FakePhoenixServer()
+        var socket: Socket? = makeSocket(server)
+        try await socket?.connect()
+        let channel = socket?.channel("room:orphan")
+        _ = try await channel?.join()
+        socket = nil
+        try await eventually("transport closed") { server.latest?.closedWith.withLock { $0 } != nil }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(server.transports.withLock { $0.count } == 1)
+        _ = channel
+    }
+
+    @Test func the_peer_close_code_is_reported_but_never_sent() async throws {
+        let server = FakePhoenixServer()
+        let socket = makeSocket(server, autoReconnect: false)
+        let events = recorder(socket)
+        try await socket.connect()
+        let transport = server.latest
+        transport?.peerClose(code: 1006)
+        try await eventually("close") { events.withLock { $0.count } == 2 }
+        #expect(events.withLock { $0.last } == .close(code: 1006, reason: ""))
+        #expect(transport?.localCloses.withLock { $0 } == [1000])
     }
 }

@@ -61,6 +61,15 @@ public final class URLSessionPhxTransport: PhxTransport, @unchecked Sendable {
     public func open() async throws {
         task.resume()
         // The handshake completes lazily; a ping round-trip confirms it.
+        // Cancelling (the connect timeout) cancels the task, which fails the ping.
+        try await withTaskCancellationHandler {
+            try await ping()
+        } onCancel: { [task] in
+            task.cancel(with: .goingAway, reason: nil)
+        }
+    }
+
+    private func ping() async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
             task.sendPing { error in
                 if let error {
@@ -185,6 +194,7 @@ public final class Socket: @unchecked Sendable {
     /// has opened, drops are retried on the backoff schedule when
     /// `autoReconnect` is on.
     public func connect() async throws {
+        if isConnected { return }
         let previous = state.withLock { state -> Task<Void, Never>? in
             state.closing = false
             state.reconnectAttempt = 0
@@ -217,39 +227,49 @@ public final class Socket: @unchecked Sendable {
     }
 
     private func open() async throws {
-        let transport: any PhxTransport
+        var opening: (any PhxTransport)?
         do {
             var merged = params
             if let paramsProvider {
                 for (key, value) in try await paramsProvider() { merged[key] = value }
             }
-            transport = makeTransport(try connectURL(merged))
+            let transport = makeTransport(try connectURL(merged))
+            opening = transport
             try await withTimeoutOrError(timeout, ChannelError.timeout("Socket connect timed out")) {
                 try await transport.open()
             }
         } catch {
+            opening?.close(code: 1000, reason: "connect failed")
             emit(.error(String(describing: error)))
             throw error
         }
+        guard let transport = opening else { return }
 
-        let accepted = state.withLock { state -> (generation: Int, channels: [Channel])? in
-            guard !state.closing else { return nil }
+        enum Accept { case accepted(Int, [Channel]), redundant, closing }
+        let outcome = state.withLock { state -> Accept in
+            guard !state.closing else { return .closing }
+            // Another open() won the race (user connect() vs backoff retry).
+            guard !state.connected else { return .redundant }
             state.generation += 1
             state.transport = transport
             state.connected = true
             state.reconnectAttempt = 0
             state.pendingHeartbeatRef = nil
-            return (state.generation, Array(state.channels.values))
+            return .accepted(state.generation, Array(state.channels.values))
         }
-        guard let accepted else {
+        switch outcome {
+        case .closing:
             transport.close(code: 1000, reason: "client disconnect")
             throw ChannelError.notConnected("Socket was disconnected while connecting")
-        }
-        startReceiveLoop(transport, generation: accepted.generation)
-        startHeartbeatLoop(generation: accepted.generation)
-        emit(.open)
-        for channel in accepted.channels where channel.state == .joined || channel.state == .errored {
-            Task { await channel.rejoin() }
+        case .redundant:
+            transport.close(code: 1000, reason: "already connected")
+        case .accepted(let generation, let channels):
+            startReceiveLoop(transport, generation: generation)
+            startHeartbeatLoop(generation: generation)
+            emit(.open)
+            for channel in channels where channel.state == .joined || channel.state == .errored {
+                Task { await channel.rejoin() }
+            }
         }
     }
 
@@ -285,7 +305,9 @@ public final class Socket: @unchecked Sendable {
         }
         guard let (transport, channels, tasks) = lost else { return }
         for task in tasks { task?.cancel() }
-        transport.close(code: code, reason: reason)
+        // Close our side normally; report the peer's code (1006 is reserved
+        // and must never be sent in a close frame).
+        transport.close(code: 1000, reason: "")
         for channel in channels { channel.handleSocketDisconnect() }
         emit(.close(code: code, reason: reason))
         scheduleReconnect()
@@ -299,15 +321,28 @@ public final class Socket: @unchecked Sendable {
             state.reconnectAttempt += 1
             state.reconnectTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                guard let self, !Task.isCancelled else { return }
-                guard !self.state.withLock({ $0.closing }) else { return }
+                guard let self, self.shouldRetry() else { return }
                 do {
                     try await self.open()
                 } catch {
-                    self.scheduleReconnect()
+                    if self.shouldRetry() { self.scheduleReconnect() }
                 }
             }
         }
+    }
+
+    /// A backoff retry proceeds only if nobody connected, disconnected or
+    /// superseded it (connect() cancels the pending retry) meanwhile.
+    private func shouldRetry() -> Bool {
+        !Task.isCancelled && state.withLock { !$0.closing && !$0.connected }
+    }
+
+    deinit {
+        let (transport, tasks) = state.withLock { state in
+            (state.transport, [state.receiveTask, state.heartbeatTask, state.reconnectTask])
+        }
+        for task in tasks { task?.cancel() }
+        transport?.close(code: 1000, reason: "socket released")
     }
 
     // MARK: Channels
@@ -370,6 +405,7 @@ public final class Socket: @unchecked Sendable {
                         frame.count == 5
                     else { continue }
                     self?.dispatch(
+                        generation: generation,
                         joinRef: frame[0].stringValue,
                         ref: frame[1].stringValue,
                         topic: frame[2].stringValue ?? "",
@@ -391,6 +427,7 @@ public final class Socket: @unchecked Sendable {
     }
 
     private func dispatch(
+        generation: Int,
         joinRef: String?,
         ref: String?,
         topic: String,
@@ -398,6 +435,8 @@ public final class Socket: @unchecked Sendable {
         payload: JSONValue
     ) {
         let (isHeartbeatReply, channel) = state.withLock { state -> (Bool, Channel?) in
+            // Frames from a superseded connection are dropped.
+            guard state.generation == generation else { return (true, nil) }
             let heartbeat = ref != nil && ref == state.pendingHeartbeatRef
             if heartbeat { state.pendingHeartbeatRef = nil }
             return (heartbeat, state.channels[topic])
