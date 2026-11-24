@@ -85,12 +85,15 @@ public actor CustomObjectSubscription {
         var sent: Bool
         /// One per `update` call coalesced into this batch.
         var waiters: [SubscriptionPromise]
+        /// The caller chose the id (to recognise its echo): the batch holds that one patch only.
+        let callerOwned: Bool
 
-        init(fields: [String: JSONValue], operationId: String, sent: Bool, waiter: SubscriptionPromise) {
+        init(fields: [String: JSONValue], operationId: String, sent: Bool, waiter: SubscriptionPromise, callerOwned: Bool) {
             self.fields = fields
             self.operationId = operationId
             self.sent = sent
             self.waiters = [waiter]
+            self.callerOwned = callerOwned
         }
     }
 
@@ -133,14 +136,20 @@ public actor CustomObjectSubscription {
 
     /// Deep-merge `fields` into the object. Live: sent now. Otherwise queued
     /// and sent after the next join; resolves once the server accepts it.
-    public func update(_ fields: [String: JSONValue]) async throws {
+    ///
+    /// `operationId` (at most 128 bytes) is sent as this patch's id and comes
+    /// back on its `object_updated`, so a caller keeping an optimistic view can
+    /// tell its own echo from other writers'. Such a patch is never compacted
+    /// with other queued updates. Nil: the subscription picks one.
+    public func update(_ fields: [String: JSONValue], operationId: String? = nil) async throws {
         if isTerminal {
             throw CustomObjectSubscriptionError.network("Cannot update a \(state.rawValue) custom-object subscription")
         }
+        let callerOwned = operationId != nil
         guard state == .live, let channel else {
-            return try await enqueue(fields)
+            return try await enqueue(fields, operationId: operationId)
         }
-        let operationId = Self.newOperationId()
+        let operationId = operationId ?? Self.newOperationId()
         let generation = generation
         var failure: CustomObjectSubscriptionError
         do {
@@ -162,7 +171,8 @@ public actor CustomObjectSubscription {
         if let rejection = queueRejection() {
             waiter.reject(rejection)
         } else {
-            queued.insert(QueuedPatch(fields: fields, operationId: operationId, sent: true, waiter: waiter), at: 0)
+            queued.insert(QueuedPatch(fields: fields, operationId: operationId, sent: true, waiter: waiter,
+                                      callerOwned: callerOwned), at: 0)
         }
         handleTransportLoss(failure, generation: generation)
         try await waiter.value()
@@ -375,15 +385,16 @@ public actor CustomObjectSubscription {
             : nil
     }
 
-    private func enqueue(_ fields: [String: JSONValue]) async throws {
+    private func enqueue(_ fields: [String: JSONValue], operationId: String?) async throws {
         let waiter = SubscriptionPromise()
         if let rejection = queueRejection() {
             waiter.reject(rejection)
-        } else if let last = queued.last, !last.sent {
+        } else if operationId == nil, let last = queued.last, !last.sent, !last.callerOwned {
             last.fields = CustomObjectWire.deepMerge(last.fields, fields)
             last.waiters.append(waiter)
         } else {
-            queued.append(QueuedPatch(fields: fields, operationId: Self.newOperationId(), sent: false, waiter: waiter))
+            queued.append(QueuedPatch(fields: fields, operationId: operationId ?? Self.newOperationId(), sent: false,
+                                      waiter: waiter, callerOwned: operationId != nil))
         }
         try await waiter.value()
     }
