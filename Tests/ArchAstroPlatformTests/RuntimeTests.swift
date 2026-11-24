@@ -204,6 +204,17 @@ import Testing
         HttpClient.parseApiError(Data(json.utf8), status: status)
     }
 
+    @Test func query_escapes_plus_and_keeps_repeated_array_keys() throws {
+        var components = try #require(URLComponents(string: "https://example.test/api/v1/threads/directory"))
+        HttpClient.setQuery([("cursor", "2026-11-23T10:00:00+00:00"), ("tags[]", "a b"), ("tags[]", "c")], on: &components)
+        let query = try #require(components.percentEncodedQuery)
+        #expect(query.contains("cursor=2026-11-23T10:00:00%2B00:00"))
+        #expect(!query.contains("+"))
+        let names = (components.queryItems ?? []).map(\.name)
+        #expect(names == ["cursor", "tags[]", "tags[]"])
+        #expect(components.queryItems?.first?.value == "2026-11-23T10:00:00+00:00", "decodes back to the literal plus")
+    }
+
     @Test func parses_structured_error_objects() {
         let error = parse(
             #"{"error":{"code":"not_found","message":"Agent missing"}}"#, status: 404
