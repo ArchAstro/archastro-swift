@@ -67158,13 +67158,18 @@
             }
           },
           {
-            "description": "Filter tasks by status. One of `\"open\"`, `\"in_progress\"`, `\"in_review\"`, or `\"done\"`. Omit to return tasks in all statuses.",
-            "example": "string",
+            "description": "Filter tasks by one or more statuses: `needs_triage`, `open`, `in_progress`, `in_review`, `paused`, `failed`, `superseding`, `done`, or `cancelled`. Pass several as `status[]=open&status[]=paused` to return tasks in any of them; a single `status=open` also works. A value outside this list matches no tasks. Omit to return tasks in all statuses.",
+            "example": [
+              "string"
+            ],
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "type": "string"
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           {
@@ -100679,13 +100684,18 @@
             }
           },
           {
-            "description": "Filter tasks by status. One of `\"open\"`, `\"in_progress\"`, `\"in_review\"`, or `\"done\"`. Omit to return tasks in all statuses.",
-            "example": "string",
+            "description": "Filter tasks by one or more statuses: `needs_triage`, `open`, `in_progress`, `in_review`, `paused`, `failed`, `superseding`, `done`, or `cancelled`. Pass several as `status[]=open&status[]=paused` to return tasks in any of them; a single `status=open` also works. A value outside this list matches no tasks. Omit to return tasks in all statuses.",
+            "example": [
+              "string"
+            ],
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "type": "string"
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           {
@@ -118299,6 +118309,36 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Kind of principal being removed. Must be `\"user\"` or `\"agent\"`.",
+            "example": "string",
+            "in": "query",
+            "name": "type",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "User ID of the principal to remove. Required when `type` is `\"user\"`.",
+            "example": "string",
+            "in": "query",
+            "name": "user",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Agent ID of the principal to remove. Required when `type` is `\"agent\"`.",
+            "example": "string",
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -124800,13 +124840,18 @@
             }
           },
           {
-            "description": "Filter tasks by status. One of `\"open\"`, `\"in_progress\"`, `\"in_review\"`, or `\"done\"`. Omit to return tasks in all statuses.",
-            "example": "string",
+            "description": "Filter tasks by one or more statuses: `needs_triage`, `open`, `in_progress`, `in_review`, `paused`, `failed`, `superseding`, `done`, or `cancelled`. Pass several as `status[]=open&status[]=paused` to return tasks in any of them; a single `status=open` also works. A value outside this list matches no tasks. Omit to return tasks in all statuses.",
+            "example": [
+              "string"
+            ],
             "in": "query",
             "name": "status",
             "required": false,
             "schema": {
-              "type": "string"
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           {
