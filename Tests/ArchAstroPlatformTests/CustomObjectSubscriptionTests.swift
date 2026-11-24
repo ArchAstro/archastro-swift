@@ -190,6 +190,46 @@ final class Recorder: @unchecked Sendable {
         await subscription.close()
     }
 
+    @Test func a_caller_operation_id_is_sent_live_and_echoed() async throws {
+        let server = FakeObjectServer()
+        let recorder = Recorder()
+        let subscription = try await live(server, recorder)
+        try await subscription.update(["title": "Mine"], operationId: "op_caller_1")
+        #expect(server.operations.withLock { $0.map(\.id) } == ["op_caller_1"])
+        server.push("object_updated", ["id": "obj_1", "fields": ["title": "Mine"], "operation_id": "op_caller_1", "partial": true])
+        try await eventually("echo") { recorder.updates.withLock { $0.count } == 1 }
+        #expect(recorder.updates.withLock { $0.first?.operationId } == "op_caller_1")
+        await subscription.close()
+    }
+
+    @Test func caller_owned_offline_patches_replay_one_by_one_under_their_ids() async throws {
+        let server = FakeObjectServer()
+        let recorder = Recorder()
+        let subscription = try await live(server, recorder)
+        server.joinError.withLock { $0 = "object_unavailable" }
+        server.phoenix.latest?.peerClose(code: 1006)
+        try await eventually("reconnecting") { recorder.state == .reconnecting }
+        let first = Task { try await subscription.update(["meta": ["a": 1]], operationId: "op_a") }
+        try await Task.sleep(nanoseconds: 5_000_000)
+        let second = Task { try await subscription.update(["meta": ["b": 2]], operationId: "op_b") }
+        try await Task.sleep(nanoseconds: 5_000_000)
+        let third = Task { try await subscription.update(["title": "Anonymous"]) }
+        try await Task.sleep(nanoseconds: 5_000_000)
+        let fourth = Task { try await subscription.update(["meta": ["c": 3]]) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        server.joinError.withLock { $0 = nil }
+        _ = try await (first.value, second.value, third.value, fourth.value)
+
+        // Owned patches keep their own ids, in order; anonymous ones still compact.
+        let ops = server.operations.withLock { $0 }
+        #expect(ops.count == 3)
+        #expect(ops.map(\.id).prefix(2) == ["op_a", "op_b"])
+        #expect(ops.first?.fields == ["meta": ["a": 1]])
+        #expect(ops.last?.fields == ["title": "Anonymous", "meta": ["c": 3]])
+        #expect(server.fields.withLock { $0 } == ["title": "Anonymous", "meta": ["v": 1, "a": 1, "b": 2, "c": 3]])
+        await subscription.close()
+    }
+
     @Test func an_update_queued_while_a_replay_is_in_flight_is_not_lost() async throws {
         let server = FakeObjectServer()
         let recorder = Recorder()
