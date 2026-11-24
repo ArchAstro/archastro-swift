@@ -71,7 +71,9 @@ public final class HttpClient: @unchecked Sendable {
     private let pathPrefix: String?
     private let defaultHeaders: [String: String]
     private let refreshOnly: Bool
-    private let session: URLSession
+    /// Session every request and SSE stream goes through. Internal (not
+    /// private) so tests can assert which session was chosen.
+    let session: URLSession
 
     private struct MutableState {
         var accessToken: String?
@@ -81,6 +83,12 @@ public final class HttpClient: @unchecked Sendable {
 
     private let state: Locked<MutableState>
 
+    /// - Parameter session: `URLSession` to send requests through. Pass one
+    ///   to use your own configuration (e.g. a `URLProtocol` stub in tests,
+    ///   or custom caching/proxy settings). `nil` (the default) creates a
+    ///   private session from `URLSessionConfiguration.default` with a 30s
+    ///   request timeout. An injected session is used as-is; its
+    ///   configuration (timeouts included) is not modified.
     public init(
         baseUrl: String,
         accessToken: String? = nil,
@@ -88,7 +96,8 @@ public final class HttpClient: @unchecked Sendable {
         onRefreshToken: (@Sendable () async throws -> String)? = nil,
         pathPrefix: String? = nil,
         defaultHeaders: [String: String] = [:],
-        refreshOnly: Bool = false
+        refreshOnly: Bool = false,
+        session: URLSession? = nil
     ) {
         var trimmed = baseUrl
         while trimmed.hasSuffix("/") { trimmed.removeLast() }
@@ -97,9 +106,13 @@ public final class HttpClient: @unchecked Sendable {
         self.pathPrefix = pathPrefix
         self.defaultHeaders = defaultHeaders
         self.refreshOnly = refreshOnly
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 30
-        self.session = URLSession(configuration: configuration)
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = 30
+            self.session = URLSession(configuration: configuration)
+        }
         self.state = Locked(
             MutableState(accessToken: accessToken, onRefreshToken: onRefreshToken)
         )
