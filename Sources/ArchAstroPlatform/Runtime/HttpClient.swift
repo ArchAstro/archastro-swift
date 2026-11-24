@@ -261,6 +261,16 @@ public final class HttpClient: @unchecked Sendable {
         return path
     }
 
+    /// Sets the query string. `URLComponents` leaves `+` alone, but Plug
+    /// decodes it as a space (form encoding), so a literal `+` (cursors,
+    /// timestamps with offsets) goes out as `%2B`, as `URLSearchParams` sends it.
+    static func setQuery(_ query: [(String, String)]?, on components: inout URLComponents) {
+        guard let query, !query.isEmpty else { return }
+        components.queryItems = query.map { URLQueryItem(name: $0.0, value: $0.1) }
+        components.percentEncodedQuery = components.percentEncodedQuery?
+            .replacingOccurrences(of: "+", with: "%2B")
+    }
+
     private func buildRequest(
         _ path: String,
         method: String,
@@ -273,9 +283,7 @@ public final class HttpClient: @unchecked Sendable {
         guard var components = URLComponents(string: urlString) else {
             throw PlatformClientError.invalidURL(urlString)
         }
-        if let query, !query.isEmpty {
-            components.queryItems = query.map { URLQueryItem(name: $0.0, value: $0.1) }
-        }
+        Self.setQuery(query, on: &components)
         guard let url = components.url else {
             throw PlatformClientError.invalidURL(urlString)
         }
